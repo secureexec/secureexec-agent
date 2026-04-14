@@ -9,10 +9,38 @@ A multi-platform EDR (Endpoint Detection & Response) agent that collects securit
 | Platform | Technology | Crate |
 |----------|-----------|-------|
 | Linux | eBPF (tracepoints + kprobes) | `linux/agent` |
-| macOS | Endpoint Security framework | `macos/agent` |
+| macOS | Endpoint Security + Network Extension | `macos/agent` |
 | Windows | ETW / WMI | `windows/agent` |
 
 Shared transport, pipeline, and event types live in `generic/`.
+
+## Collected events
+
+| Event | Linux | macOS | Windows |
+|-------|:-----:|:-----:|:-------:|
+| Process create / fork / exit | x | x | planned |
+| File create / modify / delete | x | x | planned |
+| File rename | x | x | |
+| File permission change (chmod/chown) | x | | |
+| File link / symlink | x | | |
+| Network connect | x | x | planned |
+| Network listen (accept / bind) | x | x | |
+| DNS query | x | | |
+| Registry write | | | planned |
+| Privilege change (setuid/setgid) | x | | |
+| Process access (ptrace) | x | | |
+| Process VM read/write | x | | |
+| Process signal (kill) | x | | |
+| Memory map (exec/write) | x | | |
+| memfd_create | x | | |
+| Kernel module load | x | | |
+| BPF program load | x | | |
+| Capability change | x | | |
+| Namespace change (unshare/setns) | x | | |
+| Mount / unmount | x | | |
+| keyctl | x | | |
+| io_uring setup | x | | |
+| Agent lifecycle / heartbeat | x | x | x |
 
 ## Repository layout
 
@@ -42,31 +70,45 @@ agent/
 - For Linux eBPF: `bpf-linker`, LLVM 18+, nightly Rust toolchain
 - For macOS app: Xcode 15+
 - Proto compiler: `protoc` (needed by `tonic-build` in `generic/build.rs`)
+- Docker (for cross-compiling Linux agent from macOS)
 
-### Linux agent
+### Linux agent (Docker — recommended)
+
+Build from any host (macOS / Linux) without installing LLVM or bpf-linker locally.
+First run takes ~5–10 min (builds the toolchain image); subsequent runs ~30–60 s.
 
 ```sh
-# Native build (musl, statically linked)
-cargo build --release -p secureexec-linux --target x86_64-unknown-linux-musl
-
-# Or using Docker (recommended for cross-compilation from macOS)
 make linux-build-docker
+```
+
+The static musl binary is written to `./target/x86_64-unknown-linux-musl/release/secureexec-agent-linux`.
+
+To wipe the Docker build cache and start fresh:
+
+```sh
+make linux-build-docker-clean
+```
+
+### Linux agent (native)
+
+Requires musl toolchain, LLVM 18+, and `bpf-linker` on the host.
+
+```sh
+make linux-build
 ```
 
 ### macOS agent
 
 ```sh
-# Rust sensor binary
-cargo build --release -p secureexec-macos
-
-# Full .app bundle (requires Xcode)
-make macos-bundle
+make macos-build
 ```
+
+The binary is written to `./target/release/secureexec-agent-macos`.
 
 ### Windows agent
 
 ```sh
-cargo build --release -p secureexec-windows --target x86_64-pc-windows-msvc
+make windows-build
 ```
 
 ## Configuration
