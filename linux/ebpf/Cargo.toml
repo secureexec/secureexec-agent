@@ -1,0 +1,17 @@
+[package]
+name = "secureexec-ebpf"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+secureexec-ebpf-common = { path = "../ebpf-common" }
+aya-ebpf = "0.1"
+aya-log-ebpf = "0.1"
+
+[[bin]]
+name = "secureexec-ebpf-probe"
+path = "src/main.rs"

@@ -1,0 +1,11 @@
+SecureExec Agent
+Copyright 2025 SecureExec Contributors
+
+This product includes software developed by the SecureExec project
+(https://secureexec.co).
+
+The Linux eBPF kernel programs (agent/linux/ebpf/) are dual-licensed
+under MIT and GPL ("Dual MIT/GPL") as required by the Linux kernel's
+BPF verifier for access to GPL-only BPF helpers. This kernel-level
+license tag is a technical requirement and is separate from the
+Apache 2.0 license that governs the source code of this repository.

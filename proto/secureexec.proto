@@ -1,0 +1,484 @@
+syntax = "proto3";
+
+package secureexec;
+
+service EventIngestion {
+  // Stream events from an agent to the server.
+  rpc SendEvents(stream AgentEvent) returns (SendEventsResponse);
+
+  // Single-shot batch of events.
+  rpc SendEventBatch(EventBatch) returns (SendEventsResponse);
+
+  // Agent sends buffered log entries to the server for indexing.
+  rpc SendAgentLogs(SendAgentLogsRequest) returns (SendAgentLogsResponse);
+}
+
+service AgentControl {
+  // Agent polls for pending commands (isolate, release, etc.).
+  rpc PollCommands(PollCommandsRequest) returns (PollCommandsResponse);
+
+  // Agent acknowledges completion (success or failure) of a command.
+  rpc AckCommand(AckCommandRequest) returns (AckCommandResponse);
+
+  // Isolated agent polls for current global isolation firewall rules.
+  rpc GetIsolationRules(GetIsolationRulesRequest) returns (GetIsolationRulesResponse);
+
+  // Agent fetches the active blocklist rules for this endpoint.
+  rpc GetBlocklistRules(GetBlocklistRulesRequest) returns (GetBlocklistRulesResponse);
+
+  // Agent fetches the target agent version for this endpoint.
+  rpc GetTargetVersion(GetTargetVersionRequest) returns (GetTargetVersionResponse);
+
+  // Agent streams the update package for the given platform and version.
+  rpc GetAgentUpdate(GetAgentUpdateRequest) returns (stream GetAgentUpdateChunk);
+}
+
+message AgentEvent {
+  string id           = 1;
+  string timestamp    = 2;  // RFC 3339
+  string agent_id     = 3;
+  string hostname     = 4;
+  string os           = 5;
+  string content_hash = 6;  // hex-encoded SHA-1 of event content
+  string process_guid  = 7;  // SHA-256 of (pid, start_time) — unique process id
+  int64  seqno        = 8;  // monotonic sequence number per agent
+  string username     = 9;  // uid→name resolved on Linux; empty on other OSes
+  // Process context — always populated for events that have an associated PID.
+  // Allows analysts and detection rules to inspect the actor without joining on process_guid.
+  uint32 process_pid            = 41;
+  string process_user_id        = 42;
+  string process_name           = 43;
+  string process_cmdline        = 44;
+  string parent_process_guid    = 45;
+  uint32 parent_pid             = 46;
+  string parent_user_id         = 47;
+  string parent_process_name    = 48;
+  string parent_process_cmdline = 49;
+  string parent_username        = 50;
+  string container_id           = 51;
+  string process_exe_hash       = 52;
+  uint64 process_exe_size       = 53;
+  oneof kind {
+    ProcessEvent    process_create   = 10;
+    ProcessEvent    process_fork     = 25;
+    ProcessEvent    process_exit     = 11;
+    FileEvent       file_create      = 12;
+    FileEvent       file_modify      = 13;
+    FileEvent       file_delete      = 14;
+    FileRenameEvent file_rename      = 15;
+    NetworkEvent    network_connect  = 16;
+    NetworkEvent    network_listen   = 17;
+    DnsEvent        dns_query        = 18;
+    RegistryEvent   registry_write   = 19;
+    UserLogonEvent       user_logon       = 20;
+    AgentLifecycleEvent  agent_started    = 21;
+    AgentLifecycleEvent  agent_stopping   = 22;
+    AgentHeartbeatEvent  agent_heartbeat  = 23;
+    DetectionEvent       detection        = 24;
+    // Security events (existing)
+    PrivilegeChangeEvent  privilege_change   = 26;
+    ProcessAccessEvent    process_access     = 27;
+    FilePermChangeEvent   file_perm_change   = 28;
+    MemoryMapEvent        memory_map         = 29;
+    KernelModuleEvent     kernel_module_load = 30;
+    // Security events (new)
+    ProcessVmEvent        process_vm_access  = 31;
+    MemfdCreateEvent      memfd_create       = 32;
+    BpfProgramEvent       bpf_program        = 33;
+    CapabilityChangeEvent capability_change  = 34;
+    ProcessSignalEvent    process_signal     = 35;
+    NamespaceChangeEvent  namespace_change   = 36;
+    KeyctlEvent           keyctl             = 37;
+    IoUringEvent          io_uring           = 38;
+    MountEvent            mount              = 39;
+    FileLinkEvent         file_link          = 40;
+    ProcessBlockedEvent   process_blocked    = 54;
+  }
+}
+
+message ProcessBlockedEvent {
+  uint32 pid          = 1;
+  string user_id      = 2;
+  string process_name = 3;
+  string process_guid = 4;
+  string path         = 5;   // exe path that was blocked
+  string exe_hash     = 6;   // SHA-256 of the binary (if computed)
+  uint64 exe_size     = 7;
+  string rule_name    = 8;   // which blocklist rule matched
+  string match_type   = 9;   // "hash" or "path"
+  string match_value  = 10;  // the value that matched
+  string cmdline      = 11;
+}
+
+message ProcessEvent {
+  uint32 pid                = 1;
+  uint32 parent_pid         = 2;
+  string name               = 3;
+  string path               = 4;
+  string cmdline            = 5;
+  string user_id            = 6;
+  string start_time         = 7;  // RFC 3339 — real process birth time
+  bool   snapshot           = 8;  // true when from initial process enumeration
+  string parent_process_guid = 9;  // globally unique ID of the parent process
+  sint32 exit_code           = 10; // only meaningful for process_exit; 0 = normal or unknown
+  string ld_preload          = 11; // LD_PRELOAD value at execve time; empty if not set
+  string exe_hash            = 12; // SHA-256 hex digest of executable; empty for exit/fork/snapshot
+  uint64 exe_size            = 13; // file size in bytes; 0 when unavailable
+}
+
+message FileEvent {
+  string path         = 1;
+  uint32 pid          = 2;
+  string process_name = 3;
+  string process_guid  = 4;
+  string user_id      = 5;
+}
+
+message FileRenameEvent {
+  string old_path     = 1;
+  string new_path     = 2;
+  uint32 pid          = 3;
+  string process_name = 4;
+  string process_guid  = 5;
+  string user_id      = 6;
+}
+
+message NetworkEvent {
+  uint32   pid          = 1;
+  string   process_name = 2;
+  string   src_addr     = 3;
+  uint32   src_port     = 4;
+  string   dst_addr     = 5;
+  uint32   dst_port     = 6;
+  Protocol protocol     = 7;
+  string   process_guid  = 8;
+  string   user_id      = 9;
+}
+
+enum Protocol {
+  TCP = 0;
+  UDP = 1;
+}
+
+message DnsEvent {
+  uint32          pid          = 1;
+  string          process_name = 2;
+  string          query        = 3;
+  repeated string response     = 4;
+  string          process_guid  = 5;
+  string          user_id      = 6;
+}
+
+message RegistryEvent {
+  uint32 pid          = 1;
+  string process_name = 2;
+  string key          = 3;
+  string value_name   = 4;
+  string process_guid  = 5;
+}
+
+message UserLogonEvent {
+  string username    = 1;
+  string logon_type  = 2;
+  string source_addr = 3;  // empty if local
+}
+
+message AgentLifecycleEvent {
+  string version            = 1;
+  string os                 = 2;
+  string os_version         = 3;
+  string os_kernel_version  = 4;
+}
+
+message AgentHeartbeatEvent {
+  uint64 uptime_secs        = 1;
+  uint64 spool_pending      = 2;
+  string version            = 3;
+  string os                 = 4;
+  string os_version         = 5;
+  string os_kernel_version  = 6;
+  bool   net_isolated       = 7;  // current network isolation state
+  bool   kmod_available     = 8;  // true if /dev/secureexec_kmod present at startup
+  string firewall_backend   = 9;  // active backend: "ebpf", "kmod", or "" (none)
+  string kmod_version       = 10; // loaded kmod version from /sys/module/secureexec_kmod/version, or "" if not loaded
+  uint64 ebpf_drops_process  = 11; // cumulative ring-buffer drops: PROCESS_EVENTS
+  uint64 ebpf_drops_file     = 12; // cumulative ring-buffer drops: FILE_EVENTS
+  uint64 ebpf_drops_network  = 13; // cumulative ring-buffer drops: NETWORK_EVENTS
+  uint64 ebpf_drops_security = 14; // cumulative ring-buffer drops: SECURITY_EVENTS
+}
+
+enum Severity {
+  LOW      = 0;
+  MEDIUM   = 1;
+  HIGH     = 2;
+  CRITICAL = 3;
+}
+
+message DetectionEvent {
+  string          rule_name        = 1;
+  Severity        severity         = 2;
+  string          description      = 3;
+  repeated string source_event_ids = 4;
+  uint32          pid              = 5;  // 0 if not applicable
+  string          process_guid      = 6;
+}
+
+// ---------------------------------------------------------------------------
+// Security event messages
+// ---------------------------------------------------------------------------
+
+message PrivilegeChangeEvent {
+  uint32 pid          = 1;
+  string user_id      = 2;
+  string process_name = 3;
+  string process_guid = 4;
+  string syscall      = 5;  // "setuid", "setgid", "setreuid", etc.
+  uint32 new_uid      = 6;  // 0xFFFFFFFF when not applicable
+  uint32 new_gid      = 7;  // 0xFFFFFFFF when not applicable
+}
+
+message ProcessAccessEvent {
+  uint32 pid          = 1;
+  uint32 target_pid   = 2;
+  string user_id      = 3;
+  string process_name = 4;
+  string process_guid = 5;
+  uint32 request      = 6;
+  string request_name = 7;
+}
+
+message FilePermChangeEvent {
+  uint32 pid          = 1;
+  string user_id      = 2;
+  string process_name = 3;
+  string process_guid = 4;
+  string path         = 5;
+  string kind         = 6;  // "chmod" or "chown"
+  uint32 new_mode     = 7;  // 0xFFFFFFFF when not applicable
+  uint32 new_uid      = 8;  // 0xFFFFFFFF when not applicable
+  uint32 new_gid      = 9;  // 0xFFFFFFFF when not applicable
+}
+
+message MemoryMapEvent {
+  uint32 pid          = 1;
+  string user_id      = 2;
+  string process_name = 3;
+  string process_guid = 4;
+  uint64 addr         = 5;
+  uint64 len          = 6;
+  uint32 prot         = 7;
+  uint32 flags        = 8;
+  bool   is_exec      = 9;
+  bool   is_write     = 10;
+}
+
+message KernelModuleEvent {
+  uint32 pid          = 1;
+  string user_id      = 2;
+  string process_name = 3;
+  string process_guid = 4;
+  string module_name  = 5;
+}
+
+// ---------------------------------------------------------------------------
+// New security event messages
+// ---------------------------------------------------------------------------
+
+message ProcessVmEvent {
+  uint32 pid          = 1;
+  string user_id      = 2;
+  string process_name = 3;
+  string process_guid = 4;
+  uint32 target_pid   = 5;
+  bool   is_write     = 6;
+}
+
+message MemfdCreateEvent {
+  uint32 pid          = 1;
+  string user_id      = 2;
+  string process_name = 3;
+  string process_guid = 4;
+  string name         = 5;
+  uint32 flags        = 6;
+}
+
+message BpfProgramEvent {
+  uint32 pid          = 1;
+  string user_id      = 2;
+  string process_name = 3;
+  string process_guid = 4;
+  uint32 bpf_cmd      = 5;
+  string bpf_cmd_name = 6;
+}
+
+message CapabilityChangeEvent {
+  uint32 pid          = 1;
+  string user_id      = 2;
+  string process_name = 3;
+  string process_guid = 4;
+  uint32 effective    = 5;
+  uint32 permitted    = 6;
+  uint32 inheritable  = 7;
+}
+
+message ProcessSignalEvent {
+  uint32 pid          = 1;
+  string user_id      = 2;
+  string process_name = 3;
+  string process_guid = 4;
+  uint32 target_pid   = 5;
+  uint32 signal       = 6;
+  string signal_name  = 7;
+}
+
+message NamespaceChangeEvent {
+  uint32 pid          = 1;
+  string user_id      = 2;
+  string process_name = 3;
+  string process_guid = 4;
+  string syscall      = 5;  // "unshare" or "setns"
+  uint32 flags        = 6;
+  string flags_name   = 7;
+}
+
+message KeyctlEvent {
+  uint32 pid            = 1;
+  string user_id        = 2;
+  string process_name   = 3;
+  string process_guid   = 4;
+  uint32 operation      = 5;
+  string operation_name = 6;
+}
+
+message IoUringEvent {
+  uint32 pid          = 1;
+  string user_id      = 2;
+  string process_name = 3;
+  string process_guid = 4;
+  uint32 entries      = 5;
+}
+
+message MountEvent {
+  uint32 pid          = 1;
+  string user_id      = 2;
+  string process_name = 3;
+  string process_guid = 4;
+  string source       = 5;
+  string target       = 6;
+  string fs_type      = 7;
+  uint32 flags        = 8;
+  bool   is_umount    = 9;
+}
+
+message FileLinkEvent {
+  uint32 pid          = 1;
+  string user_id      = 2;
+  string process_name = 3;
+  string process_guid = 4;
+  string src_path     = 5;
+  string dst_path     = 6;
+  bool   is_symlink   = 7;
+}
+
+message EventBatch {
+  repeated AgentEvent events = 1;
+}
+
+message SendEventsResponse {
+  uint64 accepted = 1;
+}
+
+message AgentLogEntry {
+  string timestamp   = 1;  // RFC 3339
+  string level       = 2;  // error, warn, info, debug, trace
+  string target      = 3;  // tracing target (module path)
+  string message     = 4;
+  string fields_json = 5;  // JSON object of additional fields (component, etc.)
+}
+
+message SendAgentLogsRequest {
+  string            agent_id = 1;
+  repeated AgentLogEntry entries = 2;
+}
+
+message SendAgentLogsResponse {
+  int64 accepted = 1;
+}
+
+// ---------------------------------------------------------------------------
+// AgentControl messages
+// ---------------------------------------------------------------------------
+
+message PollCommandsRequest {
+  string agent_id = 1;
+}
+
+message PollCommandsResponse {
+  repeated AgentCommand commands = 1;
+}
+
+// A command sent from the backend to an agent.
+// command_type: "isolate_host" or "release_host"
+// payload: JSON string with optional parameters, e.g. {"allow_ssh":true}
+message AgentCommand {
+  string command_id   = 1;
+  string command_type = 2;
+  string payload      = 3;
+}
+
+message AckCommandRequest {
+  string agent_id      = 1;
+  string command_id    = 2;
+  bool   success       = 3;
+  string error_message = 4;
+}
+
+message AckCommandResponse {}
+
+message GetIsolationRulesRequest {
+  string agent_id = 1;
+}
+
+message IsolationRule {
+  string ip        = 1;
+  uint32 port      = 2;
+  string direction = 3;
+}
+
+message GetIsolationRulesResponse {
+  repeated IsolationRule rules = 1;
+}
+
+message GetBlocklistRulesRequest {
+  string agent_id = 1;
+}
+
+message BlocklistRule {
+  string match_type  = 1;
+  string match_value = 2;
+  string name        = 3;
+}
+
+message GetBlocklistRulesResponse {
+  repeated BlocklistRule rules = 1;
+}
+
+message GetTargetVersionRequest {
+  string agent_id = 1;
+  string platform = 2;  // Platform key (e.g. "linux_amd64_deb"); empty if agent has no updater.
+}
+
+message GetTargetVersionResponse {
+  string target_agent_version = 1;
+  string target_agent_version_sha256 = 2;  // Hex-encoded SHA-256 of the update package for the given platform; empty if not available.
+}
+
+message GetAgentUpdateRequest {
+  string agent_id  = 1;
+  string platform  = 2;
+  string version   = 3;
+}
+
+message GetAgentUpdateChunk {
+  bytes data = 1;
+}

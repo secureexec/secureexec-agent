@@ -1,0 +1,34 @@
+[package]
+name = "secureexec-linux"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "secureexec-agent-linux"
+path = "src/main.rs"
+
+[dependencies]
+secureexec-generic.workspace = true
+secureexec-ebpf-common.workspace = true
+aya.workspace = true
+aya-log.workspace = true
+chrono.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+hostname.workspace = true
+libc.workspace = true
+nix = { version = "0.29", features = ["ioctl", "signal", "event"] }
+sha2.workspace = true
+hex.workspace = true
+lru.workspace = true
+
+[build-dependencies]
+aya-build = "0.1"
+anyhow = "1"
+secureexec-ebpf = { path = "../ebpf" }

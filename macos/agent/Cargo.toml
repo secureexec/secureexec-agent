@@ -1,0 +1,23 @@
+[package]
+name = "secureexec-macos"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "secureexec-agent-macos"
+path = "src/main.rs"
+
+[dependencies]
+secureexec-generic.workspace = true
+chrono.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+hostname.workspace = true
+libc.workspace = true
+endpoint-sec = { version = "0.4", features = ["macos_14_0_0"] }
+endpoint-sec-sys = { version = "0.4", features = ["macos_14_0_0"] }

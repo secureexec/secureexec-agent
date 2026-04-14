@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>co.secureexec.agent</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>@INSTALL_DIR@/bin/secureexec-agent-macos</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>SecureExec_LOG</key>
+        <string>info</string>
+    </dict>
+    <key>WorkingDirectory</key>
+    <string>@INSTALL_DIR@/var</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>@INSTALL_DIR@/var/agent.log</string>
+    <key>StandardErrorPath</key>
+    <string>@INSTALL_DIR@/var/agent.err</string>
+</dict>
+</plist>

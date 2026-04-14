@@ -1,0 +1,25 @@
+pub mod command;
+pub mod config;
+pub mod detection;
+pub mod error;
+pub mod event;
+pub mod filter;
+pub mod log_sender;
+pub mod log_spool;
+pub mod pipeline;
+pub mod process_table;
+pub mod sensor;
+pub mod shutdown;
+pub mod spool;
+pub mod telemetry;
+pub mod transport;
+pub mod update;
+
+pub use config::AgentConfig;
+pub use detection::DetectionEngine;
+pub use error::AgentError;
+pub use event::Event;
+pub use pipeline::Pipeline;
+pub use update::AgentUpdater;
+pub use process_table::{ParentResolver, ProcessTable, ProcessUid, ResolvedProcess};
+pub use sensor::Sensor;

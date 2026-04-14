@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key>
+    <string>secureexec-network-filter</string>
+    <key>CFBundleIdentifier</key>
+    <string>co.secureexec.app.network-filter</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.1.0</string>
+    <key>CFBundlePackageType</key>
+    <string>SYSX</string>
+    <key>CFBundleExecutable</key>
+    <string>secureexec-network-filter</string>
+    <key>NSSystemExtensionUsageDescription</key>
+    <string>SecureExec network filter monitors network connections for security telemetry.</string>
+    <key>NetworkExtension</key>
+    <dict>
+        <key>NEProviderClasses</key>
+        <dict>
+            <key>com.apple.networkextension.filter-data</key>
+            <string>secureexec_network_filter.SecureExecFilterDataProvider</string>
+        </dict>
+    </dict>
+    <key>NSExtension</key>
+    <dict>
+        <key>NSExtensionPointIdentifier</key>
+        <string>com.apple.networkextension.filter-data</string>
+        <key>NSExtensionPrincipalClass</key>
+        <string>secureexec_network_filter.SecureExecFilterDataProvider</string>
+    </dict>
+</dict>
+</plist>
