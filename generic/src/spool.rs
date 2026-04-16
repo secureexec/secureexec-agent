@@ -2,10 +2,15 @@ use std::path::Path;
 
 use rusqlite::{params, Connection};
 use tokio::sync::{mpsc, oneshot};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::error::{AgentError, Result};
 use crate::event::Event;
+
+/// Hard ceiling on the number of events retained in the spool. Prevents
+/// the SQLite file from growing without bound when the server is unreachable
+/// for extended periods. When exceeded, oldest rows are trimmed first.
+const MAX_SPOOL_ROWS: i64 = 2_000_000;
 
 // ---------------------------------------------------------------------------
 // Internal SQLite-backed spool (private — only accessed by the actor thread)
@@ -59,7 +64,29 @@ impl EventSpool {
             .map_err(|e| AgentError::Pipeline(format!("spool tx commit: {e}")))?;
 
         debug!(count = events.len(), "spooled events");
+        self.enforce_retention();
         Ok(())
+    }
+
+    /// Evict oldest rows when the table exceeds `MAX_SPOOL_ROWS`. Called after
+    /// every push so the spool file cannot grow without bound during prolonged
+    /// server outages. Eviction is a single `DELETE` with `ORDER BY id`, which
+    /// is cheap on a WAL-mode SQLite database.
+    fn enforce_retention(&self) {
+        let count: i64 = self.conn
+            .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
+            .unwrap_or(0);
+        if count <= MAX_SPOOL_ROWS {
+            return;
+        }
+        let overflow = count - MAX_SPOOL_ROWS;
+        match self.conn.execute(
+            "DELETE FROM events WHERE id IN (SELECT id FROM events ORDER BY id ASC LIMIT ?1)",
+            params![overflow],
+        ) {
+            Ok(n) => warn!(dropped = n, retained = MAX_SPOOL_ROWS, "spool hit retention cap; dropped oldest rows"),
+            Err(e) => warn!(error = %e, "spool retention delete failed"),
+        }
     }
 
     fn peek(&self, limit: usize) -> Result<(Vec<i64>, Vec<Event>)> {

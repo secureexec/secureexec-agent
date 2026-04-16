@@ -61,7 +61,14 @@ pub struct NoopCommandHandler;
 #[async_trait]
 impl CommandHandler for NoopCommandHandler {
     async fn handle(&self, cmd: &AgentCommand) -> Result<()> {
+        // Return an explicit error rather than a silent Ok(()). Previously
+        // commands would be ack'd as "succeeded" on a platform that has no
+        // handler wired up, making it impossible for the server to tell the
+        // difference between "command executed" and "command silently dropped".
         tracing::warn!(command_type = %cmd.command_type, "command received but no handler registered");
-        Ok(())
+        Err(crate::error::AgentError::Platform(format!(
+            "no command handler registered on this platform (command_type={})",
+            cmd.command_type
+        )))
     }
 }

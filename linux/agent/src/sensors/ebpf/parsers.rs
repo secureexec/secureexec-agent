@@ -119,7 +119,10 @@ pub(super) fn parse_file_event(data: &[u8]) -> Option<BpfEvent> {
                 FILE_EVT_CREATE => Some(BpfEvent::FileCreate { pid: e.tgid, uid: e.uid, comm, filename }),
                 FILE_EVT_MODIFY => Some(BpfEvent::FileModify { pid: e.tgid, uid: e.uid, comm, filename }),
                 FILE_EVT_DELETE => Some(BpfEvent::FileDelete { pid: e.tgid, uid: e.uid, comm, filename }),
-                _ => unreachable!(),
+                // The outer guard already filtered to these three tags; if
+                // the ring buffer is ever corrupted we drop the event rather
+                // than panic the sensor thread.
+                _ => None,
             }
         }
         FILE_EVT_RENAME => {
@@ -165,7 +168,7 @@ pub(super) fn parse_network_event(data: &[u8]) -> Option<BpfEvent> {
                     pid: e.tgid, uid: e.uid, comm, src_addr: src, sport: e.sport,
                     protocol: e.protocol,
                 }),
-                _ => unreachable!(),
+                _ => None,
             }
         }
         NET_EVT_V6_CONNECT | NET_EVT_V6_ACCEPT | NET_EVT_V6_BIND => {
@@ -188,7 +191,7 @@ pub(super) fn parse_network_event(data: &[u8]) -> Option<BpfEvent> {
                     pid: e.tgid, uid: e.uid, comm, src_addr: src, sport: e.sport,
                     protocol: e.protocol,
                 }),
-                _ => unreachable!(),
+                _ => None,
             }
         }
         NET_EVT_DNS_QUERY_V4 => {

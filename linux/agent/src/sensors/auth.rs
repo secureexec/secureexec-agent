@@ -125,10 +125,27 @@ async fn run_auth_log_tail(
                     continue;
                 }
 
+                // Cap each tail read to prevent OOM if auth.log rotated
+                // while we were asleep and now contains hundreds of MB of
+                // new data. On overflow we skip ahead — an operator would
+                // rather miss some old logon lines than crash the sensor.
+                const MAX_CHUNK: u64 = 4 * 1024 * 1024;
+                let available = meta.len().saturating_sub(offset);
+                let to_read = available.min(MAX_CHUNK);
+                if available > MAX_CHUNK {
+                    warn!(
+                        path = %path.display(),
+                        skipped = available - MAX_CHUNK,
+                        "linux-auth: auth log grew beyond read cap; skipping oldest bytes"
+                    );
+                    offset = meta.len() - MAX_CHUNK;
+                }
                 let mut file = File::open(&path).await?;
                 file.seek(std::io::SeekFrom::Start(offset)).await?;
-                let mut chunk = String::new();
-                file.read_to_string(&mut chunk).await?;
+                let mut buf = vec![0u8; to_read as usize];
+                let n = file.read(&mut buf).await?;
+                buf.truncate(n);
+                let chunk = String::from_utf8_lossy(&buf).to_string();
                 offset = file.stream_position().await?;
 
                 let mut text = String::new();

@@ -26,6 +26,7 @@ async fn main() -> secureexec_generic::error::Result<()> {
         ca_cert: config.tls_ca_cert.clone(),
         client_cert: config.tls_client_cert.clone(),
         client_key: config.tls_client_key.clone(),
+        server_name: config.tls_server_name.clone(),
     };
     let transport = GrpcTransport::new(&config.backend_url, tls, config.auth_token.clone());
     let mut pipeline = Pipeline::new(config, CONFIG_PATH, VERSION.trim(), transport);

@@ -131,12 +131,32 @@ pub async fn drain_and_clean_script_logs() {
         };
 
         let path = entry.path();
-        let content = match tokio::fs::read_to_string(&path).await {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!(path = %path.display(), error = %e, "failed to read leftover script log");
-                continue;
+        // Cap each log read to avoid exhausting memory if a runaway script
+        // left behind a multi-GB log file. Anything beyond the cap is
+        // truncated with a marker so operators can still see it happened.
+        const MAX_DRAIN_BYTES: u64 = 8 * 1024 * 1024;
+        let content = match tokio::fs::metadata(&path).await {
+            Ok(meta) if meta.len() > MAX_DRAIN_BYTES => {
+                match tokio::fs::read(&path).await {
+                    Ok(bytes) => {
+                        let take = bytes.len().saturating_sub((bytes.len() as u64 - MAX_DRAIN_BYTES) as usize);
+                        let tail_start = bytes.len().saturating_sub(take);
+                        let s = String::from_utf8_lossy(&bytes[tail_start..]).to_string();
+                        format!("[log truncated: {} bytes, keeping last {}]\n{}", bytes.len(), take, s)
+                    }
+                    Err(e) => {
+                        tracing::warn!(path = %path.display(), error = %e, "failed to read leftover script log");
+                        continue;
+                    }
+                }
             }
+            _ => match tokio::fs::read_to_string(&path).await {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!(path = %path.display(), error = %e, "failed to read leftover script log");
+                    continue;
+                }
+            },
         };
 
         if !content.is_empty() {

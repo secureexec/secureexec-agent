@@ -60,12 +60,21 @@ impl Sensor for LinuxEbpfSensor {
         let snap_tx   = tx.clone();
         let snap_host = hostname.clone();
         let uid_map_snap = uid_map.clone();
-        tokio::task::spawn_blocking(move || {
+        let snap_join = tokio::task::spawn_blocking(move || {
             let mut resolver = procfs::UidResolver::new(uid_map_snap);
             snapshot::emit_process_snapshot(&snap_tx, &snap_host, &mut resolver);
         })
-        .await
-        .ok();
+        .await;
+        if let Err(e) = snap_join {
+            // Do not swallow a panic from the snapshot thread: if /proc
+            // enumeration panicked we want the sensor startup to abort so
+            // the agent can be restarted cleanly instead of running with
+            // a partial/empty process table.
+            tracing::error!(error = %e, "linux-ebpf: process snapshot task crashed");
+            return Err(secureexec_generic::error::AgentError::Pipeline(
+                format!("process snapshot task panicked: {e}"),
+            ));
+        }
         info!("linux-ebpf: process snapshot complete");
         let mut uid_resolver = procfs::UidResolver::new(uid_map);
 

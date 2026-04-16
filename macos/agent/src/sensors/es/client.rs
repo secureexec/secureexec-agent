@@ -1,21 +1,44 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use endpoint_sec::{Client, Event, Message};
 use endpoint_sec_sys::es_event_type_t;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use super::EsEvent;
 use super::helpers::*;
+
+/// Number of ES events dropped because the pipeline channel was full.
+/// Exposed as a process-wide counter so the agent can log/export it.
+pub static ES_EVENTS_DROPPED: AtomicU64 = AtomicU64::new(0);
 
 pub fn run_es_client(tx: tokio::sync::mpsc::Sender<EsEvent>, stop: Arc<AtomicBool>) {
     endpoint_sec::version::set_runtime_version(14, 0, 0);
 
     let handler_tx = tx.clone();
     let mut client = match Client::new(move |_client, msg: Message| {
+        // The ES callback runs on a kernel-driven thread and must NEVER
+        // block — blocking here creates backpressure up to the kernel and
+        // eventually causes ES to drop or unsubscribe our client. We use
+        // `try_send` and accept event loss under pressure, tracking it
+        // with a counter so the operator sees that the channel is
+        // undersized.
         if let Some(es_event) = parse_message(&msg) {
-            let _ = handler_tx.blocking_send(es_event);
+            match handler_tx.try_send(es_event) {
+                Ok(()) => {}
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    let prev = ES_EVENTS_DROPPED.fetch_add(1, Ordering::Relaxed);
+                    // Log every 1024th drop so we don't flood the log.
+                    if prev.is_multiple_of(1024) {
+                        warn!(dropped_total = prev + 1, "macos-es: pipeline channel full — dropping event");
+                    }
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    // Pipeline has shut down; ignore further events until
+                    // the client is dropped.
+                }
+            }
         }
     }) {
         Ok(c) => c,

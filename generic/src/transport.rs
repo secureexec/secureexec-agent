@@ -14,6 +14,9 @@ const GRPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const GRPC_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// Per-request deadline for download_agent_update (streaming, can be large).
 const GRPC_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(300);
+/// Hard cap on the size of a single agent update download. Prevents a
+/// malicious or buggy server from exhausting disk on the agent host.
+const MAX_UPDATE_SIZE: u64 = 512 * 1024 * 1024;
 
 use crate::command::AgentCommand;
 use crate::error::{AgentError, Result};
@@ -55,6 +58,29 @@ pub struct TlsConfig {
     pub ca_cert: Option<PathBuf>,
     pub client_cert: Option<PathBuf>,
     pub client_key: Option<PathBuf>,
+    /// SNI / certificate hostname. When `None`, it is derived from the
+    /// endpoint URL; bare-IP endpoints without an explicit override will
+    /// fail TLS verification (which is the desired secure-by-default).
+    pub server_name: Option<String>,
+}
+
+/// Derive the TLS SNI name used for certificate verification.
+/// Returns the explicit override when set; otherwise parses the hostname
+/// out of the endpoint URL; otherwise returns `None`.
+fn derive_tls_server_name(endpoint: &str, override_name: &Option<String>) -> Option<String> {
+    if let Some(name) = override_name {
+        if !name.is_empty() { return Some(name.clone()); }
+    }
+    // Strip scheme (`http://`, `https://`) and optional port to get the host.
+    let without_scheme = endpoint.split_once("://").map(|(_, r)| r).unwrap_or(endpoint);
+    let host = without_scheme.split('/').next().unwrap_or("");
+    // `[::1]:port` — take up to `]`; otherwise split on `:` once.
+    let host = if host.starts_with('[') {
+        host.split(']').next().unwrap_or("").trim_start_matches('[')
+    } else {
+        host.split(':').next().unwrap_or("")
+    };
+    if host.is_empty() { None } else { Some(host.to_string()) }
 }
 
 /// gRPC transport — ships event batches to secureexec-server via `SendEventBatch`.
@@ -93,9 +119,14 @@ impl GrpcTransport {
                 .map_err(|e| AgentError::Transport(format!("read CA cert {}: {e}", ca_path.display())))?;
             let ca = tonic::transport::Certificate::from_pem(ca_pem);
 
+            let sni = derive_tls_server_name(&self.endpoint, &self.tls.server_name)
+                .ok_or_else(|| AgentError::Transport(format!(
+                    "cannot derive TLS SNI from endpoint '{}' — set `tls_server_name` in config",
+                    self.endpoint
+                )))?;
             let mut tls_config = tonic::transport::ClientTlsConfig::new()
                 .ca_certificate(ca)
-                .domain_name("localhost");
+                .domain_name(sni.clone());
 
             if let (Some(cert_path), Some(key_path)) = (&self.tls.client_cert, &self.tls.client_key) {
                 let cert_pem = std::fs::read(cert_path)
@@ -104,9 +135,9 @@ impl GrpcTransport {
                     .map_err(|e| AgentError::Transport(format!("read client key {}: {e}", key_path.display())))?;
                 let identity = tonic::transport::Identity::from_pem(cert_pem, key_pem);
                 tls_config = tls_config.identity(identity);
-                info!("mTLS enabled (CA + client cert)");
+                info!(sni = %sni, "mTLS enabled (CA + client cert)");
             } else {
-                info!("TLS enabled (CA only, no client cert)");
+                info!(sni = %sni, "TLS enabled (CA only, no client cert)");
             }
 
             ep = ep.tls_config(tls_config)
@@ -146,7 +177,8 @@ impl Transport for GrpcTransport {
             }
         };
 
-        let request = self.make_request(batch);
+        let mut request = self.make_request(batch);
+        request.set_timeout(GRPC_REQUEST_TIMEOUT);
 
         match client.send_event_batch(request).await {
             Ok(resp) => {
@@ -177,7 +209,8 @@ impl Transport for GrpcTransport {
                 return Err(e);
             }
         };
-        let req = self.make_request(request);
+        let mut req = self.make_request(request);
+        req.set_timeout(GRPC_REQUEST_TIMEOUT);
         match client.send_agent_logs(req).await {
             Ok(resp) => {
                 let accepted = resp.into_inner().accepted;
@@ -230,9 +263,14 @@ impl GrpcControlClient {
             let ca_pem = std::fs::read(ca_path)
                 .map_err(|e| AgentError::Transport(format!("control: read CA cert {}: {e}", ca_path.display())))?;
             let ca = tonic::transport::Certificate::from_pem(ca_pem);
+            let sni = derive_tls_server_name(&self.endpoint, &self.tls.server_name)
+                .ok_or_else(|| AgentError::Transport(format!(
+                    "control: cannot derive TLS SNI from endpoint '{}' — set `tls_server_name` in config",
+                    self.endpoint
+                )))?;
             let mut tls_config = tonic::transport::ClientTlsConfig::new()
                 .ca_certificate(ca)
-                .domain_name("localhost");
+                .domain_name(sni);
             if let (Some(cert_path), Some(key_path)) = (&self.tls.client_cert, &self.tls.client_key) {
                 let cert_pem = std::fs::read(cert_path)
                     .map_err(|e| AgentError::Transport(format!("control: read client cert {}: {e}", cert_path.display())))?;
@@ -390,8 +428,20 @@ impl GrpcControlClient {
         let mut file = tokio::fs::File::create(path)
             .await
             .map_err(|e| AgentError::Transport(format!("create update file: {e}")))?;
+        let mut total: u64 = 0;
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|e| AgentError::Transport(format!("stream: {e}")))?;
+            total = total.saturating_add(chunk.data.len() as u64);
+            if total > MAX_UPDATE_SIZE {
+                // Clean up the partially written file before erroring out so
+                // subsequent retries don't see a corrupt artifact.
+                drop(file);
+                let _ = tokio::fs::remove_file(path).await;
+                return Err(AgentError::Transport(format!(
+                    "agent update exceeds {} byte cap (got {}); aborting",
+                    MAX_UPDATE_SIZE, total
+                )));
+            }
             file.write_all(&chunk.data)
                 .await
                 .map_err(|e| AgentError::Transport(format!("write update file: {e}")))?;

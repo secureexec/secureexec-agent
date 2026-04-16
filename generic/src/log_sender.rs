@@ -3,6 +3,7 @@
 //! enqueued to avoid recursion when sending logs.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use chrono::Utc;
@@ -12,6 +13,17 @@ use tracing_subscriber::layer::Context;
 use tracing_subscriber::Layer;
 
 use crate::transport::pb;
+
+/// Number of agent log entries dropped because the spool channel was full.
+/// Exposed as a process-global counter so it can be surfaced in heartbeats
+/// / observed by an operator. Previously `try_send` errors were silently
+/// ignored, making it impossible to detect log loss.
+pub static LOG_ENTRIES_DROPPED: AtomicU64 = AtomicU64::new(0);
+
+/// Snapshot the current dropped-entry count.
+pub fn dropped_log_entries() -> u64 {
+    LOG_ENTRIES_DROPPED.load(Ordering::Relaxed)
+}
 
 /// One log entry produced by the layer and stored in the spool.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -75,7 +87,11 @@ where
             Err(_) => return,
         };
         if let Some(tx) = guard.as_ref() {
-            let _ = tx.try_send(entry);
+            if tx.try_send(entry).is_err() {
+                // Channel is either full or closed. Either way we drop
+                // this entry and increment the counter so loss is visible.
+                LOG_ENTRIES_DROPPED.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 }

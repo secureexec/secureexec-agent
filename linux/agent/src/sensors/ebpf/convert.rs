@@ -35,6 +35,15 @@ pub(super) fn convert_bpf_events(
     let kind: Option<EventKind> = match bpf {
         BpfEvent::ExecArgv { tgid, cmdline, ld_preload } => {
             if !cmdline.is_empty() {
+                // Cap pending_argv so a misbehaving process (exec that never
+                // calls the post-exec tracepoint, ring-buffer drops, etc.)
+                // cannot pin unbounded memory. 16k entries × (cmdline+LD_PRELOAD)
+                // fits comfortably even on a high-churn host; eviction is
+                // coarse but cheap.
+                const PENDING_ARGV_CAP: usize = 16 * 1024;
+                if pending_argv.len() >= PENDING_ARGV_CAP {
+                    pending_argv.clear();
+                }
                 pending_argv.insert(tgid, (cmdline, ld_preload));
             }
             return out;
@@ -140,7 +149,11 @@ pub(super) fn convert_bpf_events(
             let (p_uid, p_name, p_path) = match cache.get(&parent_pid) {
                 Some(p) => (p.uid, p.name.clone(), p.path.clone()),
                 None => {
-                    let p_path = procfs::read_proc_exe(child_pid).unwrap_or_default();
+                    // Read the PARENT's exe, not the child's. Immediately
+                    // after fork the child is still a clone of the parent,
+                    // but any later exec() in the child would invalidate
+                    // that assumption; parent_pid is the stable target.
+                    let p_path = procfs::read_proc_exe(parent_pid).unwrap_or_default();
                     let p_name = if !p_path.is_empty() {
                         p_path.rsplit('/').next().unwrap_or(&p_path).to_string()
                     } else {

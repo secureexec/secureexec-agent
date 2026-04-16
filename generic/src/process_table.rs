@@ -86,6 +86,18 @@ fn truncate_to_millis(dt: DateTime<Utc>) -> DateTime<Utc> {
     dt.with_nanosecond(millis_only).unwrap_or(dt)
 }
 
+/// Hard ceiling on the number of entries kept in the table. Once reached,
+/// the oldest entries (by `start_time`) are evicted so the table cannot grow
+/// without bound if `ProcessExit` events are lost (e.g. SECURITY_EVENTS ring
+/// overflow on a busy host).
+const MAX_TABLE_SIZE: usize = 100_000;
+
+/// Entries without an observed `ProcessExit` are force-reaped after this
+/// duration. Long-running daemons are routinely recreated via synthetic
+/// resolution, so a 7-day cap is safe and bounds memory for pathological
+/// churn patterns where exits are never observed.
+const FORCE_REAP_AFTER: Duration = Duration::from_secs(7 * 24 * 3600);
+
 /// In-memory table of known processes, keyed by `(pid, start_time)`.
 ///
 /// Because the key includes `start_time`, PID reuse never overwrites an
@@ -95,6 +107,8 @@ pub struct ProcessTable {
     agent_id: String,
     processes: HashMap<ProcessKey, ProcessInfo>,
     exit_ttl: Duration,
+    force_reap_after: Duration,
+    max_size: usize,
 }
 
 impl ProcessTable {
@@ -103,6 +117,8 @@ impl ProcessTable {
             agent_id,
             processes: HashMap::new(),
             exit_ttl,
+            force_reap_after: FORCE_REAP_AFTER,
+            max_size: MAX_TABLE_SIZE,
         }
     }
 
@@ -192,20 +208,35 @@ impl ProcessTable {
         self.processes.insert(key, info);
     }
 
-    /// Remove entries that exited longer than `exit_ttl` ago.
+    /// Remove entries that exited longer than `exit_ttl` ago, force-reap
+    /// live entries older than `force_reap_after` (ProcessExit was probably
+    /// lost), and enforce the hard `max_size` cap by evicting oldest-first.
     pub fn reap_expired(&mut self) {
-        let cutoff = Utc::now() - chrono::Duration::from_std(self.exit_ttl).unwrap_or_default();
+        let now = Utc::now();
+        let exit_cutoff = now - chrono::Duration::from_std(self.exit_ttl).unwrap_or_default();
+        let live_cutoff = now - chrono::Duration::from_std(self.force_reap_after).unwrap_or_default();
         let before = self.processes.len();
         self.processes.retain(|_key, info| {
-            if let Some(exit) = info.exit_time {
-                exit > cutoff
-            } else {
-                true
+            match info.exit_time {
+                Some(exit) => exit > exit_cutoff,
+                None => info.start_time > live_cutoff,
             }
         });
         let reaped = before - self.processes.len();
         if reaped > 0 {
             debug!(reaped, "process table: reaped expired entries");
+        }
+
+        if self.processes.len() > self.max_size {
+            let overflow = self.processes.len() - self.max_size;
+            let mut by_age: Vec<(ProcessKey, DateTime<Utc>)> = self.processes.iter()
+                .map(|(k, v)| (*k, v.start_time))
+                .collect();
+            by_age.sort_by_key(|(_, st)| *st);
+            for (key, _) in by_age.into_iter().take(overflow) {
+                self.processes.remove(&key);
+            }
+            debug!(evicted = overflow, cap = self.max_size, "process table: evicted oldest entries to enforce cap");
         }
     }
 

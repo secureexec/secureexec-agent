@@ -143,10 +143,23 @@ struct StatInfo {
 fn read_proc_stat(pid: u32) -> Option<StatInfo> {
     let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
 
+    // `comm` is the second field, wrapped in parens, and may itself contain
+    // spaces, parens, or arbitrary bytes (e.g. `(ba)d(name)`). The rest of
+    // the line is fixed-width whitespace-separated numeric fields, so the
+    // LAST `)` in the line reliably marks the end of comm regardless of
+    // what the process chose to set its name to.
     let comm_start = stat.find('(')?;
     let comm_end = stat.rfind(')')?;
+    if comm_end <= comm_start {
+        return None;
+    }
     let name = stat[comm_start + 1..comm_end].to_string();
 
+    // Guard against a truncated `/proc/pid/stat` line: if there aren't at
+    // least two bytes after `)` we cannot parse the state+ppid fields.
+    if comm_end + 2 > stat.len() {
+        return None;
+    }
     let rest = &stat[comm_end + 2..];
     let fields: Vec<&str> = rest.split_whitespace().collect();
     let parent_pid: u32 = fields.get(1)?.parse().ok()?;
@@ -154,6 +167,8 @@ fn read_proc_stat(pid: u32) -> Option<StatInfo> {
 
     let clock_ticks = clock_ticks_per_sec();
     let boot_time = boot_time_secs();
+    // `clock_ticks_per_sec` falls back to 100 on sysconf failure so this
+    // division cannot panic even on exotic libcs/sysconf errors.
     let start_secs = boot_time + (starttime_ticks / clock_ticks);
     let start_time = DateTime::from_timestamp(start_secs as i64, 0).unwrap_or_default();
 
@@ -178,7 +193,11 @@ fn read_proc_uid(pid: u32) -> Option<u32> {
 }
 
 fn clock_ticks_per_sec() -> u64 {
-    unsafe { libc::sysconf(libc::_SC_CLK_TCK) as u64 }
+    // Safety: sysconf(_SC_CLK_TCK) has no side effects; a negative return
+    // indicates an error. Fall back to the canonical 100 Hz value rather
+    // than trust a bogus value (or 0, which would div-by-zero in callers).
+    let raw = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    if raw <= 0 { 100 } else { raw as u64 }
 }
 
 fn boot_time_secs() -> u64 {

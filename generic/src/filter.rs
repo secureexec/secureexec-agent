@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, VecDeque};
 
 use tracing::debug;
 
@@ -77,15 +77,22 @@ impl Default for FilterChain {
 ///
 /// Useful for suppressing identical recurring events (e.g. the same process
 /// launching repeatedly, or the same file being touched in a loop).
+///
+/// Previously this used a `HashSet` with a full clear on overflow, which
+/// caused the filter to forget every hash at once and allow a burst of
+/// duplicates through after the cap was reached. We now use an LRU queue:
+/// once capacity is exceeded, only the oldest hash is evicted per insert.
 pub struct DeduplicationFilter {
-    seen: HashSet<String>,
+    seen: HashMap<String, ()>,
+    order: VecDeque<String>,
     capacity: usize,
 }
 
 impl DeduplicationFilter {
     pub fn new(capacity: usize) -> Self {
         Self {
-            seen: HashSet::with_capacity(capacity),
+            seen: HashMap::with_capacity(capacity),
+            order: VecDeque::with_capacity(capacity),
             capacity,
         }
     }
@@ -107,16 +114,18 @@ impl EventFilter for DeduplicationFilter {
             return FilterVerdict::Pass;
         }
 
-        if self.seen.contains(&event.content_hash) {
+        if self.seen.contains_key(&event.content_hash) {
             return FilterVerdict::Drop;
         }
 
         if self.seen.len() >= self.capacity {
-            debug!(filter = "dedup", capacity = self.capacity, "hash table full — clearing");
-            self.seen.clear();
+            if let Some(oldest) = self.order.pop_front() {
+                self.seen.remove(&oldest);
+            }
         }
 
-        self.seen.insert(event.content_hash.clone());
+        self.order.push_back(event.content_hash.clone());
+        self.seen.insert(event.content_hash.clone(), ());
         FilterVerdict::Pass
     }
 }

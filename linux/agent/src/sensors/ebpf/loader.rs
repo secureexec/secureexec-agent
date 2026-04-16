@@ -335,14 +335,17 @@ pub(super) fn poll_ebpf(
     stop: Arc<AtomicBool>,
     drop_counters: Arc<EbpfDropCounters>,
 ) -> std::result::Result<(), String> {
-    let mut proc_rb = RingBuf::try_from(ebpf.take_map("PROCESS_EVENTS").unwrap())
-        .map_err(|e| format!("PROCESS_EVENTS: {e}"))?;
-    let mut file_rb = RingBuf::try_from(ebpf.take_map("FILE_EVENTS").unwrap())
-        .map_err(|e| format!("FILE_EVENTS: {e}"))?;
-    let mut net_rb  = RingBuf::try_from(ebpf.take_map("NETWORK_EVENTS").unwrap())
-        .map_err(|e| format!("NETWORK_EVENTS: {e}"))?;
-    let mut sec_rb  = RingBuf::try_from(ebpf.take_map("SECURITY_EVENTS").unwrap())
-        .map_err(|e| format!("SECURITY_EVENTS: {e}"))?;
+    // `take_map` returns None if the probe object is stale or the map was
+    // renamed; panicking here would crash the agent on any loader mismatch.
+    // Surface a structured error so the caller can log it and fall back.
+    let take_rb = |ebpf: &mut Ebpf, name: &str| -> std::result::Result<RingBuf<MapData>, String> {
+        let m = ebpf.take_map(name).ok_or_else(|| format!("map '{name}' not found in eBPF object"))?;
+        RingBuf::try_from(m).map_err(|e| format!("{name}: {e}"))
+    };
+    let mut proc_rb = take_rb(&mut ebpf, "PROCESS_EVENTS")?;
+    let mut file_rb = take_rb(&mut ebpf, "FILE_EVENTS")?;
+    let mut net_rb  = take_rb(&mut ebpf, "NETWORK_EVENTS")?;
+    let mut sec_rb  = take_rb(&mut ebpf, "SECURITY_EVENTS")?;
     let drop_maps = take_drop_maps(&mut ebpf);
 
     info!("linux-ebpf: polling ring buffers via epoll");

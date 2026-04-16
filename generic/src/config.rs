@@ -54,6 +54,15 @@ pub struct AgentConfig {
     #[serde(default)]
     pub tls_client_key: Option<PathBuf>,
 
+    /// Server name used for TLS SNI + certificate verification.
+    /// Must match one of the `subjectAltName` entries on the server cert.
+    /// When `None`, the hostname is derived from `backend_url`; when the URL
+    /// has no hostname (e.g. numeric-IP literal), TLS verification will be
+    /// rejected. Set this explicitly for bare-IP deployments using a cert
+    /// that pins a specific DNS name.
+    #[serde(default)]
+    pub tls_server_name: Option<String>,
+
     /// Bearer token sent to server with every gRPC call.
     #[serde(default)]
     pub auth_token: Option<String>,
@@ -110,6 +119,7 @@ impl Default for AgentConfig {
             tls_ca_cert: None,
             tls_client_cert: None,
             tls_client_key: None,
+            tls_server_name: None,
             auth_token: None,
             firewall_backend: default_firewall_backend(),
         }

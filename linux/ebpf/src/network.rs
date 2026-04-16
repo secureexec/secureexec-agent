@@ -683,8 +683,20 @@ pub fn inet_bind_entry(ctx: ProbeContext) -> u32 {
 }
 
 fn try_inet_bind(ctx: &ProbeContext) -> Result<(), i64> {
-    let sock: u64 = ctx.arg(0).ok_or(1i64)?;
-    read_sock_v4_and_emit(sock, NET_EVT_V4_BIND, NET_PROTO_TCP)
+    // inet_bind(sock, uaddr, addr_len) — first arg is `struct socket *`.
+    // Layout of struct socket on 64-bit Linux (include/linux/net.h):
+    //   offset  0: state          (socket_state, u32)
+    //   offset  4: type           (short, u16) + 2 bytes pad
+    //   offset  8: flags          (unsigned long)
+    //   offset 16: file           (struct file *)
+    //   offset 24: sk             (struct sock *)     <— this is what we want
+    //   offset 32: ops            (const struct proto_ops *)
+    // We must dereference `sk` before reading sock_common fields; otherwise
+    // `daddr`/`saddr` would read `state`/`type` and produce garbage telemetry.
+    let socket_ptr: u64 = ctx.arg(0).ok_or(1i64)?;
+    let sk: u64 = unsafe { bpf_probe_read_kernel((socket_ptr + 24) as *const u64)? };
+    if sk == 0 { return Ok(()); }
+    read_sock_v4_and_emit(sk, NET_EVT_V4_BIND, NET_PROTO_TCP)
 }
 
 #[kprobe]
@@ -696,10 +708,12 @@ pub fn inet6_bind_entry(ctx: ProbeContext) -> u32 {
 }
 
 fn try_inet6_bind(ctx: &ProbeContext) -> Result<(), i64> {
-    // inet6_bind(sock, uaddr, addr_len) — first arg is struct socket *,
-    // which starts with struct sock * at offset 0.
-    let sock: u64 = ctx.arg(0).ok_or(1i64)?;
-    read_sock_v6_and_emit(sock, NET_EVT_V6_BIND, NET_PROTO_TCP)
+    // inet6_bind(sock, uaddr, addr_len) — first arg is `struct socket *`;
+    // `sk` lives at offset 24 (see comment in try_inet_bind above).
+    let socket_ptr: u64 = ctx.arg(0).ok_or(1i64)?;
+    let sk: u64 = unsafe { bpf_probe_read_kernel((socket_ptr + 24) as *const u64)? };
+    if sk == 0 { return Ok(()); }
+    read_sock_v6_and_emit(sk, NET_EVT_V6_BIND, NET_PROTO_TCP)
 }
 
 // ---------------------------------------------------------------------------

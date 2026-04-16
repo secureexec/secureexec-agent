@@ -226,7 +226,7 @@ impl AgentUpdater for LinuxAgentUpdater {
         };
 
         info!(component = "agent-update", kmod_included = kmod_path.is_some(), "spawning detached install and restart");
-        let (_child, log_path) = spawn_detached_logged(&cmd, "agent-update")?;
+        let log_path = spawn_detached_logged(&cmd, "agent-update")?;
         tokio::spawn(tail_script_log(log_path, "agent-update".to_string(), None));
         Ok(())
     }

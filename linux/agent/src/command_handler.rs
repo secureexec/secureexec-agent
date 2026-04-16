@@ -128,7 +128,10 @@ impl LinuxCommandHandler {
             0u32
         } else {
             Ipv4Addr::from_str(ip)
-                .map(|a| u32::from_ne_bytes(a.octets()))
+                // kmod stores IPs in network byte order; Ipv4Addr::octets()
+                // already returns bytes big-endian, so from_be_bytes yields
+                // the correct NBO `u32` on any host endianness.
+                .map(|a| u32::from_be_bytes(a.octets()))
                 .unwrap_or_else(|_| {
                     warn!(ip = %ip, "invalid IP in isolation rule, treating as any");
                     0u32
@@ -189,14 +192,18 @@ impl CommandHandler for LinuxCommandHandler {
                     AgentError::Platform("firewall not available — cannot isolate".into())
                 })?;
 
+                // Fail-closed: a malformed payload must not silently collapse
+                // to "isolate with only the default rules", because that would
+                // cut legitimate operators out of the host on top of the
+                // attacker still having a foothold. Surface the error and let
+                // the caller decide whether to retry.
                 let payload: IsolatePayload = if cmd.payload.is_empty() {
                     IsolatePayload::default()
                 } else {
-                    serde_json::from_str(&cmd.payload)
-                        .unwrap_or_else(|e| {
-                            warn!(error = %e, "failed to parse isolate payload, using defaults");
-                            IsolatePayload::default()
-                        })
+                    serde_json::from_str(&cmd.payload).map_err(|e| {
+                        warn!(error = %e, "rejecting isolate_host with malformed payload");
+                        AgentError::Platform(format!("isolate_host: invalid payload: {e}"))
+                    })?
                 };
 
                 let mut extra_rules: Vec<SeFwRule> = Vec::new();
@@ -264,7 +271,7 @@ impl CommandHandler for LinuxCommandHandler {
                     pkg = pkg_cmd,
                 );
                 match spawn_detached_logged(&script, "agent-delete") {
-                    Ok((_child, log_path)) => {
+                    Ok(log_path) => {
                         tokio::spawn(tail_script_log(log_path, "agent-delete".to_string(), None));
                         Ok(())
                     }

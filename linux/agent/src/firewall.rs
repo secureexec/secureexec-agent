@@ -121,10 +121,17 @@ impl KmodFirewall {
     // -----------------------------------------------------------------------
 
     /// Build an outbound whitelist rule for a given IP address.
+    ///
+    /// The kmod expects `ip` in **network byte order** (the same layout as
+    /// `iph->saddr`/`iph->daddr` on the wire). `Ipv4Addr::octets()` already
+    /// returns bytes in most-significant-first order, so `from_be_bytes`
+    /// produces the correct NBO `u32` regardless of host endianness. Using
+    /// `from_ne_bytes` on little-endian hosts silently byte-swapped the IP
+    /// and broke rule matching.
     pub fn rule_allow_ip_out(ip: IpAddr) -> Option<SeFwRule> {
         match ip {
             IpAddr::V4(v4) => {
-                let ip_be = u32::from_ne_bytes(v4.octets());
+                let ip_be = u32::from_be_bytes(v4.octets());
                 Some(SeFwRule {
                     ip: ip_be,
                     port: 0,
@@ -136,11 +143,12 @@ impl KmodFirewall {
         }
     }
 
-    /// Build an inbound whitelist rule for a given IP address.
+    /// Build an inbound whitelist rule for a given IP address. See
+    /// `rule_allow_ip_out` for the byte-order rationale.
     pub fn rule_allow_ip_in(ip: IpAddr) -> Option<SeFwRule> {
         match ip {
             IpAddr::V4(v4) => {
-                let ip_be = u32::from_ne_bytes(v4.octets());
+                let ip_be = u32::from_be_bytes(v4.octets());
                 Some(SeFwRule {
                     ip: ip_be,
                     port: 0,

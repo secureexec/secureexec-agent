@@ -93,11 +93,16 @@ impl Sensor for MacosEsSensor {
         // -- initial process snapshot via libproc (blocking) --
         let snap_tx = tx.clone();
         let snap_host = hostname.clone();
-        tokio::task::spawn_blocking(move || {
+        let snap_join = tokio::task::spawn_blocking(move || {
             convert::emit_process_snapshot(&snap_tx, &snap_host);
         })
-        .await
-        .ok();
+        .await;
+        if let Err(e) = snap_join {
+            tracing::error!(error = %e, "macos-es: process snapshot task crashed");
+            return Err(secureexec_generic::error::AgentError::Pipeline(
+                format!("process snapshot task panicked: {e}"),
+            ));
+        }
         info!("macos-es: process snapshot complete");
 
         // -- live ES events via dedicated thread --

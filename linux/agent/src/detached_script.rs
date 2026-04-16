@@ -24,15 +24,19 @@ pub const SCRIPT_LOG_SUFFIX: &str = ".log";
 
 /// Spawns a detached shell script in a separate systemd scope.
 /// Stdout/stderr go to a unique log file: `/var/log/secureexec-agent.<component>.<uuid8>.log`.
-/// Returns the spawned child and the log file path (for tailing).
+/// Returns the log file path (for tailing).
 ///
 /// The script is not in the agent's cgroup, so it survives when the agent is stopped.
 /// Requires systemd (systemd-run in PATH).
 /// `script` must not contain single quotes (it is wrapped in single quotes for sh -c).
+///
+/// A background thread is spawned that `wait()`s on the intermediate `sh -c`
+/// child so the kernel can reap the PID immediately — otherwise we would
+/// accumulate zombie processes for every isolate/release/update cycle.
 pub fn spawn_detached_logged(
     script: &str,
     component: &str,
-) -> Result<(std::process::Child, PathBuf), AgentError> {
+) -> Result<PathBuf, AgentError> {
     let run_id = Uuid::new_v4();
     let short_id = &run_id.to_string()[..8];
     let log_path = PathBuf::from(format!(
@@ -53,9 +57,16 @@ pub fn spawn_detached_logged(
         .stderr(Stdio::null())
         .spawn();
     match child {
-        Ok(c) => {
-            info!(run_id = %run_id, pid = c.id(), "detached script spawn ok (systemd-run)");
-            Ok((c, log_path))
+        Ok(mut c) => {
+            let pid = c.id();
+            info!(run_id = %run_id, pid = pid, "detached script spawn ok (systemd-run)");
+            std::thread::Builder::new()
+                .name(format!("detached-reaper-{}", pid))
+                .spawn(move || {
+                    let _ = c.wait();
+                })
+                .map_err(|e| AgentError::Platform(format!("spawn reaper thread: {e}")))?;
+            Ok(log_path)
         }
         Err(e) => {
             error!(run_id = %run_id, error = %e, "detached script spawn failed (systemd-run)");

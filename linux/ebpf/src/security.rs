@@ -395,6 +395,12 @@ fn try_sys_enter_memfd_create(ctx: &TracePointContext) -> Result<(), i64> {
         e.flags = flags;
         e._pad2 = 0;
         e.comm = bpf_get_current_comm().unwrap_or([0u8; TASK_COMM_LEN]);
+        // Ring buffer memory is reused between reservations and is NOT zeroed
+        // on allocation. Without this NUL sentinel, when `name_ptr` is NULL
+        // (or the user-string read silently fails on the first byte) we
+        // would leak whatever `name` from a prior memfd_create / unrelated
+        // event still lives in that slot.
+        e.name[0] = 0;
         if name_ptr != 0 {
             unsafe {
                 let _ = bpf_probe_read_user_str_bytes(name_ptr as *const u8, &mut e.name);
@@ -645,6 +651,12 @@ fn try_sys_enter_mount(ctx: &TracePointContext) -> Result<(), i64> {
         e.flags = flags;
         e._pad2 = 0;
         e.comm = bpf_get_current_comm().unwrap_or([0u8; TASK_COMM_LEN]);
+        // See comment in try_sys_enter_memfd_create: ring buffer slots are
+        // reused without zeroing, so NULL user pointers (or short reads)
+        // must not leak stale path bytes from prior events.
+        e.source[0] = 0;
+        e.target[0] = 0;
+        e.fs_type[0] = 0;
         if src_ptr  != 0 { unsafe { let _ = bpf_probe_read_user_str_bytes(src_ptr  as *const u8, &mut e.source);  } }
         if tgt_ptr  != 0 { unsafe { let _ = bpf_probe_read_user_str_bytes(tgt_ptr  as *const u8, &mut e.target);  } }
         if type_ptr != 0 { unsafe { let _ = bpf_probe_read_user_str_bytes(type_ptr as *const u8, &mut e.fs_type); } }
@@ -679,6 +691,12 @@ fn try_sys_enter_umount(ctx: &TracePointContext) -> Result<(), i64> {
         e.flags = flags;
         e._pad2 = 0;
         e.comm = bpf_get_current_comm().unwrap_or([0u8; TASK_COMM_LEN]);
+        // Zero source/target/fs_type so that NULL name_ptr (or a short
+        // user-space read) cannot surface stale path bytes from a previous
+        // MountEvent / UmountEvent slot.
+        e.source[0] = 0;
+        e.target[0] = 0;
+        e.fs_type[0] = 0;
         if name_ptr != 0 { unsafe { let _ = bpf_probe_read_user_str_bytes(name_ptr as *const u8, &mut e.target); } }
         buf.submit(0);
     } else {

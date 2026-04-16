@@ -4,9 +4,15 @@ use std::path::Path;
 
 use rusqlite::{params, Connection};
 use tokio::sync::{mpsc, oneshot};
+use tracing::warn;
 
 use crate::error::{AgentError, Result};
 use crate::log_sender::AgentLogEntry;
+
+/// Retention cap for agent-log spool. When the server is unreachable, this
+/// bounds the on-disk footprint of the log database to a reasonable size;
+/// excess rows are dropped oldest-first on every push.
+const MAX_LOG_ROWS: i64 = 500_000;
 
 struct LogSpoolInner {
     conn: Connection,
@@ -45,7 +51,26 @@ impl LogSpoolInner {
         }
         tx.commit()
             .map_err(|e| AgentError::Pipeline(format!("log spool tx commit: {e}")))?;
+        self.enforce_retention();
         Ok(())
+    }
+
+    fn enforce_retention(&self) {
+        let count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM agent_logs", [], |r| r.get(0))
+            .unwrap_or(0);
+        if count <= MAX_LOG_ROWS {
+            return;
+        }
+        let overflow = count - MAX_LOG_ROWS;
+        match self.conn.execute(
+            "DELETE FROM agent_logs WHERE id IN (SELECT id FROM agent_logs ORDER BY id ASC LIMIT ?1)",
+            params![overflow],
+        ) {
+            Ok(n) => warn!(dropped = n, retained = MAX_LOG_ROWS, "log spool hit retention cap; dropped oldest rows"),
+            Err(e) => warn!(error = %e, "log spool retention delete failed"),
+        }
     }
 
     fn peek(&self, limit: usize) -> Result<(Vec<i64>, Vec<AgentLogEntry>)> {

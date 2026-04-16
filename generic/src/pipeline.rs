@@ -722,7 +722,12 @@ async fn ingest_loop(
                             event.os = os.clone();
                         }
                         {
-                            let mut table = ptable.write().unwrap();
+                            // Recover from a poisoned lock rather than propagating the
+                            // panic: the process table is in-memory state that is
+                            // safe to keep mutating even if another thread panicked
+                            // mid-update. Swallowing `PoisonError` lets the pipeline
+                            // stay up and keep forwarding events.
+                            let mut table = ptable.write().unwrap_or_else(|e| e.into_inner());
                             table.update(&event);
                             if let Some(pid) = event.kind.pid() {
                                 let pst = event.kind.process_start_time();
@@ -854,7 +859,7 @@ async fn flush_batch(
     } else {
         batch.clear();
     }
-    ptable.write().unwrap().reap_expired();
+    ptable.write().unwrap_or_else(|e| e.into_inner()).reap_expired();
 }
 
 fn run_detections(
@@ -866,7 +871,7 @@ fn run_detections(
     os: &str,
 ) {
     let detections = {
-        let table = ptable.read().unwrap();
+        let table = ptable.read().unwrap_or_else(|e| e.into_inner());
         let ctx = DetectionContext {
             process_table: &table,
         };
@@ -908,6 +913,9 @@ async fn drain_loop(
 
     loop {
         tokio::select! {
+            // `changed()` only fires on edge-transition. After the first
+            // cancel notification we still want the loop to observe the
+            // shutdown flag, so we also check `*cancel.borrow()` below.
             _ = cancel.changed() => {
                 let _ = tokio::time::timeout(
                     Duration::from_secs(10),
@@ -915,12 +923,28 @@ async fn drain_loop(
                 ).await;
                 return;
             }
-            _ = interval.tick() => {}
+            _ = interval.tick() => {
+                if *cancel.borrow() {
+                    // Saw the cancel on a prior iteration; honour it by
+                    // doing one last bounded drain and exiting.
+                    let _ = tokio::time::timeout(
+                        Duration::from_secs(10),
+                        drain_once(&spool, &transport, batch_size),
+                    ).await;
+                    return;
+                }
+            }
         }
 
         // drain_once involves a gRPC send — drop it instantly on cancel.
         tokio::select! {
             _ = cancel.changed() => {
+                // Give the in-flight drain one bounded opportunity to
+                // finish so we don't lose the batch we just peeked.
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(10),
+                    drain_once(&spool, &transport, batch_size),
+                ).await;
                 return;
             }
             _ = drain_once(&spool, &transport, batch_size) => {}

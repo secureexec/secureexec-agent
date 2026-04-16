@@ -124,6 +124,12 @@ fn try_sys_enter_execve(ctx: &TracePointContext) -> Result<(), i64> {
 
         macro_rules! read_arg {
             ($offset:expr, $idx:expr) => {{
+                // Ring buffer memory is reused across events and is NOT zeroed
+                // between reservations; without this NUL sentinel, a failed
+                // `bpf_probe_read_user_str_bytes` would leave stale bytes from
+                // a previous event visible in args[$idx], effectively leaking
+                // argv fragments across unrelated processes.
+                event.args[$idx][0] = 0;
                 let ptr: u64 = unsafe {
                     bpf_probe_read_user((argv_ptr + $offset) as *const u64).unwrap_or(0)
                 };
