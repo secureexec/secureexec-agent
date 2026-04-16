@@ -1,0 +1,456 @@
+name: Build Linux Agent
+
+on:
+  push:
+    tags:
+      - '*'
+  # Run manually from Actions tab to warm cache ahead of a tag build.
+  workflow_dispatch:
+
+env:
+  # Pin nightly to a date that uses LLVM 20 (matches llvm-20-dev from apt).
+  # Rust 1.90.0-nightly (2025-07-09), LLVM 20.1.7 — verified working.
+  NIGHTLY: nightly-2025-07-10
+  REGISTRY: ghcr.io
+  # Keep the same image path as the monorepo workflow so the backend server
+  # always pulls from one canonical location.
+  IMAGE_NAME: ${{ github.repository_owner }}/secureexec/agent-files
+  # Static linking for musl target. Defined globally so rust-cache includes it
+  # in its automatic key hash (the action runs before the build step).
+  RUSTFLAGS: "-C link-arg=-static"
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Read version
+        id: version
+        run: |
+          VERSION=$(cat linux/agent/version | tr -d '[:space:]')
+          KMOD_VERSION="$VERSION"
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "kmod_version=$KMOD_VERSION" >> $GITHUB_OUTPUT
+          echo "deb_name=secureexec-agent_${VERSION}_amd64.deb" >> $GITHUB_OUTPUT
+          echo "rpm_name=secureexec-agent-${VERSION}-1.x86_64.rpm" >> $GITHUB_OUTPUT
+          echo "kmod_deb_name=secureexec-kmod_${KMOD_VERSION}_all.deb" >> $GITHUB_OUTPUT
+          echo "kmod_rpm_name=secureexec-kmod-${KMOD_VERSION}-1.noarch.rpm" >> $GITHUB_OUTPUT
+
+      - name: Log in to container registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check if image already exists
+        if: github.ref_type == 'tag'
+        id: check
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:linux-amd64-${VERSION}"
+          if docker manifest inspect "$IMAGE" > /dev/null 2>&1; then
+            echo "Image $IMAGE already exists, skipping build."
+            echo "skip=true" >> $GITHUB_OUTPUT
+          else
+            echo "skip=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Install LLVM 20 and system deps
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key \
+            | sudo tee /etc/apt/trusted.gpg.d/llvm.asc >/dev/null
+          echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-20 main" \
+            | sudo tee /etc/apt/sources.list.d/llvm20.list
+          sudo apt-get update
+          sudo apt-get install -y llvm-20-dev clang libelf-dev dpkg-dev protobuf-compiler musl-tools dkms rpm
+
+      - name: Install pinned Rust nightly
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          rustup toolchain install ${{ env.NIGHTLY }} --component rust-src
+          # Add musl target to both stable (used by cargo build) and the pinned nightly
+          rustup target add x86_64-unknown-linux-musl
+          rustup target add x86_64-unknown-linux-musl --toolchain ${{ env.NIGHTLY }}
+          # aya-build invokes `rustup run nightly ...`; remove the generic
+          # nightly (if any) and symlink our pinned version in its place.
+          rustup toolchain uninstall nightly 2>/dev/null || true
+          ln -sf "$HOME/.rustup/toolchains/${NIGHTLY}-x86_64-unknown-linux-gnu" \
+                 "$HOME/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu"
+          rustup run nightly rustc -vV | head -4
+
+      # Restore/save cargo registry, git deps, and target/. Key includes -static so cache
+      # matches our RUSTFLAGS (-C link-arg=-static); lockfile hash is added by the action.
+      - name: Cache Rust
+        if: steps.check.outputs.skip != 'true'
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: linux-agent-${{ env.NIGHTLY }}-x86_64-unknown-linux-musl-static
+          shared-key: linux-agent
+          cache-bin: "false"
+          workspaces: . -> target
+
+      - name: Cache bpf-linker
+        if: steps.check.outputs.skip != 'true'
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/bpf-linker
+          key: bpf-linker-llvm20-${{ env.NIGHTLY }}-${{ runner.arch }}
+
+      - name: Install bpf-linker
+        if: steps.check.outputs.skip != 'true'
+        env:
+          LLVM_PREFIX: /usr/lib/llvm-20
+          RUSTFLAGS: ""
+        run: |
+          if ! command -v bpf-linker > /dev/null 2>&1; then
+            cargo install --no-default-features --features llvm-20 bpf-linker
+          fi
+
+      - name: Build Linux agent (static musl)
+        if: steps.check.outputs.skip != 'true'
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: x86_64-linux-musl-gcc
+        run: |
+          cargo build --release --manifest-path Cargo.toml -p secureexec-linux \
+            --target x86_64-unknown-linux-musl
+          # Verify it's fully static (ldd prints "statically linked" for static binaries)
+          ldd target/x86_64-unknown-linux-musl/release/secureexec-agent-linux 2>&1 | grep -q "statically linked" \
+            && echo "OK: fully static binary" || echo "WARNING: binary is not fully static"
+
+      - name: Package agent as .deb
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          DEB_NAME="${{ steps.version.outputs.deb_name }}"
+          INSTALL_DIR=/opt/secureexec
+          DEB_STAGE=$(mktemp -d)
+
+          mkdir -p "$DEB_STAGE/DEBIAN"
+          mkdir -p "$DEB_STAGE${INSTALL_DIR}/bin"
+          mkdir -p "$DEB_STAGE/etc/systemd/system"
+
+          cp target/x86_64-unknown-linux-musl/release/secureexec-agent-linux \
+            "$DEB_STAGE${INSTALL_DIR}/bin/secureexec-agent-linux"
+          chmod 755 "$DEB_STAGE${INSTALL_DIR}/bin/secureexec-agent-linux"
+
+          cat > "$DEB_STAGE/DEBIAN/control" <<EOF
+          Package: secureexec-agent
+          Version: ${VERSION}
+          Architecture: amd64
+          Maintainer: Cydanix <support@cydanix.com>
+          Suggests: secureexec-kmod
+          Description: SecureExec endpoint agent
+           eBPF-based process, file, and network monitoring agent.
+           Statically linked — no runtime dependencies required.
+           Install secureexec-kmod for optional kmod-based network isolation fallback.
+          Priority: optional
+          Section: admin
+          EOF
+          sed -i 's/^          //' "$DEB_STAGE/DEBIAN/control"
+
+          cat > "$DEB_STAGE/etc/systemd/system/secureexec-agent.service" <<EOF
+          [Unit]
+          Description=SecureExec Agent
+          After=network.target
+
+          [Service]
+          Type=simple
+          ExecStart=${INSTALL_DIR}/bin/secureexec-agent-linux
+          WorkingDirectory=${INSTALL_DIR}/var
+          Restart=on-failure
+          RestartSec=5
+          Environment=SecureExec_LOG=info
+          AmbientCapabilities=CAP_BPF CAP_PERFMON CAP_SYS_RESOURCE CAP_NET_ADMIN
+
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+          sed -i 's/^          //' "$DEB_STAGE/etc/systemd/system/secureexec-agent.service"
+
+          cat > "$DEB_STAGE/DEBIAN/postinst" <<'EOF'
+          #!/bin/sh
+          set -e
+          mkdir -p /opt/secureexec/var /opt/secureexec/etc
+          systemctl daemon-reload
+          systemctl enable secureexec-agent.service
+          systemctl start secureexec-agent.service || true
+          echo "SecureExec agent installed and started."
+          EOF
+          sed -i 's/^          //' "$DEB_STAGE/DEBIAN/postinst"
+          chmod 755 "$DEB_STAGE/DEBIAN/postinst"
+
+          cat > "$DEB_STAGE/DEBIAN/prerm" <<'EOF'
+          #!/bin/sh
+          set -e
+          systemctl stop secureexec-agent.service 2>/dev/null || true
+          systemctl disable secureexec-agent.service 2>/dev/null || true
+          EOF
+          sed -i 's/^          //' "$DEB_STAGE/DEBIAN/prerm"
+          chmod 755 "$DEB_STAGE/DEBIAN/prerm"
+
+          dpkg-deb --build "$DEB_STAGE" "$DEB_NAME"
+          rm -rf "$DEB_STAGE"
+          echo "Built: $DEB_NAME"
+
+      - name: Package agent as .rpm
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          RPM_NAME="${{ steps.version.outputs.rpm_name }}"
+          INSTALL_DIR=/opt/secureexec
+
+          mkdir -p ~/rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
+          cp target/x86_64-unknown-linux-musl/release/secureexec-agent-linux ~/rpmbuild/SOURCES/
+
+          UNITDIR=/usr/lib/systemd/system
+
+          cat > ~/rpmbuild/SPECS/secureexec-agent.spec <<EOF
+          Name:           secureexec-agent
+          Version:        ${VERSION}
+          Release:        1
+          Summary:        SecureExec endpoint agent
+          License:        Proprietary
+          BuildArch:      x86_64
+          Suggests:       secureexec-kmod
+
+          %description
+          eBPF-based process, file, and network monitoring agent.
+          Statically linked — no runtime dependencies required.
+          Install secureexec-kmod for optional kmod-based network isolation fallback.
+
+          %install
+          mkdir -p %{buildroot}${INSTALL_DIR}/bin
+          mkdir -p %{buildroot}${UNITDIR}
+          install -m 755 %{_sourcedir}/secureexec-agent-linux \
+            %{buildroot}${INSTALL_DIR}/bin/secureexec-agent-linux
+          cat > %{buildroot}${UNITDIR}/secureexec-agent.service <<'SVCEOF'
+          [Unit]
+          Description=SecureExec Agent
+          After=network.target
+
+          [Service]
+          Type=simple
+          ExecStart=${INSTALL_DIR}/bin/secureexec-agent-linux
+          WorkingDirectory=${INSTALL_DIR}/var
+          Restart=on-failure
+          RestartSec=5
+          Environment=SecureExec_LOG=info
+          AmbientCapabilities=CAP_BPF CAP_PERFMON CAP_SYS_RESOURCE CAP_NET_ADMIN
+
+          [Install]
+          WantedBy=multi-user.target
+          SVCEOF
+
+          %files
+          ${INSTALL_DIR}/bin/secureexec-agent-linux
+          ${UNITDIR}/secureexec-agent.service
+
+          %post
+          mkdir -p ${INSTALL_DIR}/var ${INSTALL_DIR}/etc
+          systemctl daemon-reload
+          systemctl enable secureexec-agent.service || true
+          systemctl start secureexec-agent.service || true
+          echo "SecureExec agent installed and started."
+
+          %preun
+          systemctl stop secureexec-agent.service 2>/dev/null || true
+          systemctl disable secureexec-agent.service 2>/dev/null || true
+          EOF
+          sed -i 's/^          //' ~/rpmbuild/SPECS/secureexec-agent.spec
+
+          rpmbuild -bb ~/rpmbuild/SPECS/secureexec-agent.spec
+          cp ~/rpmbuild/RPMS/x86_64/"$RPM_NAME" .
+          echo "Built: $RPM_NAME"
+
+      - name: Package kmod as .deb
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          KMOD_VERSION="${{ steps.version.outputs.kmod_version }}"
+          KMOD_DEB_NAME="${{ steps.version.outputs.kmod_deb_name }}"
+          DEB_STAGE=$(mktemp -d)
+
+          mkdir -p "$DEB_STAGE/DEBIAN"
+          KMOD_SRC="$DEB_STAGE/usr/src/secureexec-kmod-${KMOD_VERSION}"
+          mkdir -p "$KMOD_SRC"
+          cp linux/kmod/main.c     "$KMOD_SRC/"
+          cp linux/kmod/firewall.c "$KMOD_SRC/"
+          cp linux/kmod/firewall.h "$KMOD_SRC/"
+          cp linux/kmod/compat.h   "$KMOD_SRC/"
+          cp linux/kmod/Makefile   "$KMOD_SRC/"
+          cp linux/kmod/dkms.conf  "$KMOD_SRC/"
+          sed -i "s/0\\.0\\.0-dev/${KMOD_VERSION}/g" "$KMOD_SRC/main.c" "$KMOD_SRC/dkms.conf"
+
+          cat > "$DEB_STAGE/DEBIAN/control" <<EOF
+          Package: secureexec-kmod
+          Version: ${KMOD_VERSION}
+          Architecture: all
+          Maintainer: Cydanix <support@cydanix.com>
+          Depends: dkms
+          Description: SecureExec kernel module — optional kmod-based network isolation
+           Provides the secureexec_kmod netfilter driver for host network isolation.
+           Install alongside secureexec-agent to enable kmod isolation fallback.
+          Priority: optional
+          Section: kernel
+          EOF
+          sed -i 's/^          //' "$DEB_STAGE/DEBIAN/control"
+
+          cat > "$DEB_STAGE/DEBIAN/postinst" <<EOF
+          #!/bin/sh
+          set -e
+          KMOD_VER="${KMOD_VERSION}"
+          dkms add -m secureexec-kmod -v "\${KMOD_VER}" 2>/dev/null || true
+          dkms build -m secureexec-kmod -v "\${KMOD_VER}" || \
+            echo "WARNING: secureexec_kmod build failed — kmod isolation unavailable"
+          dkms install -m secureexec-kmod -v "\${KMOD_VER}" || \
+            echo "WARNING: secureexec_kmod install failed — kmod isolation unavailable"
+          modprobe secureexec_kmod 2>/dev/null || true
+          echo "secureexec-kmod installed."
+          EOF
+          sed -i 's/^          //' "$DEB_STAGE/DEBIAN/postinst"
+          chmod 755 "$DEB_STAGE/DEBIAN/postinst"
+
+          cat > "$DEB_STAGE/DEBIAN/prerm" <<EOF
+          #!/bin/sh
+          set -e
+          KMOD_VER="${KMOD_VERSION}"
+          rmmod secureexec_kmod 2>/dev/null || true
+          dkms remove -m secureexec-kmod -v "\${KMOD_VER}" --all 2>/dev/null || true
+          EOF
+          sed -i 's/^          //' "$DEB_STAGE/DEBIAN/prerm"
+          chmod 755 "$DEB_STAGE/DEBIAN/prerm"
+
+          dpkg-deb --build "$DEB_STAGE" "$KMOD_DEB_NAME"
+          rm -rf "$DEB_STAGE"
+          echo "Built: $KMOD_DEB_NAME"
+
+      - name: Package kmod as .rpm
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          KMOD_VERSION="${{ steps.version.outputs.kmod_version }}"
+          KMOD_RPM_NAME="${{ steps.version.outputs.kmod_rpm_name }}"
+
+          mkdir -p ~/rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
+          cp linux/kmod/main.c     ~/rpmbuild/SOURCES/
+          cp linux/kmod/firewall.c ~/rpmbuild/SOURCES/
+          cp linux/kmod/firewall.h ~/rpmbuild/SOURCES/
+          cp linux/kmod/compat.h   ~/rpmbuild/SOURCES/
+          cp linux/kmod/Makefile   ~/rpmbuild/SOURCES/
+          cp linux/kmod/dkms.conf  ~/rpmbuild/SOURCES/
+          sed -i "s/0\\.0\\.0-dev/${KMOD_VERSION}/g" ~/rpmbuild/SOURCES/main.c ~/rpmbuild/SOURCES/dkms.conf
+
+          KMOD_SRC_DIR=/usr/src/secureexec-kmod-${KMOD_VERSION}
+
+          cat > ~/rpmbuild/SPECS/secureexec-kmod.spec <<EOF
+          Name:           secureexec-kmod
+          Version:        ${KMOD_VERSION}
+          Release:        1
+          Summary:        SecureExec kernel module — optional kmod-based network isolation
+          License:        Proprietary
+          BuildArch:      noarch
+          Requires:       dkms
+
+          %description
+          Provides the secureexec_kmod netfilter driver for host network isolation.
+          Install alongside secureexec-agent to enable kmod isolation fallback.
+
+          %install
+          mkdir -p %{buildroot}${KMOD_SRC_DIR}
+          install -m 644 %{_sourcedir}/main.c     %{buildroot}${KMOD_SRC_DIR}/
+          install -m 644 %{_sourcedir}/firewall.c %{buildroot}${KMOD_SRC_DIR}/
+          install -m 644 %{_sourcedir}/firewall.h %{buildroot}${KMOD_SRC_DIR}/
+          install -m 644 %{_sourcedir}/compat.h   %{buildroot}${KMOD_SRC_DIR}/
+          install -m 644 %{_sourcedir}/Makefile   %{buildroot}${KMOD_SRC_DIR}/
+          install -m 644 %{_sourcedir}/dkms.conf  %{buildroot}${KMOD_SRC_DIR}/
+
+          %files
+          ${KMOD_SRC_DIR}/
+
+          %post
+          KMOD_VER="${KMOD_VERSION}"
+          dkms add -m secureexec-kmod -v "\${KMOD_VER}" 2>/dev/null || true
+          dkms build -m secureexec-kmod -v "\${KMOD_VER}" || echo "WARNING: secureexec_kmod build failed"
+          dkms install -m secureexec-kmod -v "\${KMOD_VER}" || echo "WARNING: secureexec_kmod install failed"
+          modprobe secureexec_kmod 2>/dev/null || true
+
+          %preun
+          KMOD_VER="${KMOD_VERSION}"
+          rmmod secureexec_kmod 2>/dev/null || true
+          dkms remove -m secureexec-kmod -v "\${KMOD_VER}" --all 2>/dev/null || true
+          EOF
+          sed -i 's/^          //' ~/rpmbuild/SPECS/secureexec-kmod.spec
+
+          rpmbuild -bb ~/rpmbuild/SPECS/secureexec-kmod.spec
+          cp ~/rpmbuild/RPMS/noarch/"$KMOD_RPM_NAME" .
+          echo "Built: $KMOD_RPM_NAME"
+
+      - name: Upload to GitHub Release
+        if: github.ref_type == 'tag' && steps.check.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          KMOD_VERSION="${{ steps.version.outputs.kmod_version }}"
+          DEB_NAME="${{ steps.version.outputs.deb_name }}"
+          RPM_NAME="${{ steps.version.outputs.rpm_name }}"
+          KMOD_DEB_NAME="${{ steps.version.outputs.kmod_deb_name }}"
+          KMOD_RPM_NAME="${{ steps.version.outputs.kmod_rpm_name }}"
+          TAG="${{ github.ref_name }}"
+
+          DEB_LABEL="SecureExec Linux Agent v${VERSION} (amd64 .deb)"
+          RPM_LABEL="SecureExec Linux Agent v${VERSION} (x86_64 .rpm)"
+          KMOD_DEB_LABEL="SecureExec kmod v${KMOD_VERSION} — optional isolation driver (all .deb)"
+          KMOD_RPM_LABEL="SecureExec kmod v${KMOD_VERSION} — optional isolation driver (noarch .rpm)"
+
+          if ! gh release view "$TAG" --repo "${{ github.repository }}" > /dev/null 2>&1; then
+            gh release create "$TAG" \
+              --title "Release $TAG" \
+              --generate-notes \
+              "${DEB_NAME}#${DEB_LABEL}" \
+              "${RPM_NAME}#${RPM_LABEL}" \
+              "${KMOD_DEB_NAME}#${KMOD_DEB_LABEL}" \
+              "${KMOD_RPM_NAME}#${KMOD_RPM_LABEL}"
+          else
+            gh release upload "$TAG" \
+              "${DEB_NAME}#${DEB_LABEL}" \
+              "${RPM_NAME}#${RPM_LABEL}" \
+              "${KMOD_DEB_NAME}#${KMOD_DEB_LABEL}" \
+              "${KMOD_RPM_NAME}#${KMOD_RPM_LABEL}" \
+              --clobber
+          fi
+
+      # ── Docker image: init container that seeds the shared agents host-path ──
+
+      - name: Build and push agent-files Docker image
+        if: github.ref_type == 'tag' && steps.check.outputs.skip != 'true'
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          KMOD_VERSION="${{ steps.version.outputs.kmod_version }}"
+          DEB_NAME="${{ steps.version.outputs.deb_name }}"
+          RPM_NAME="${{ steps.version.outputs.rpm_name }}"
+          KMOD_DEB_NAME="${{ steps.version.outputs.kmod_deb_name }}"
+          KMOD_RPM_NAME="${{ steps.version.outputs.kmod_rpm_name }}"
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:linux-amd64-${VERSION}"
+
+          # Collect all linux/amd64 packages into pkg/ with versioned canonical names.
+          # The Dockerfile CMD will create versionless symlinks at runtime.
+          mkdir -p pkg
+          cp "$DEB_NAME" pkg/secureexec-agent_linux_amd64_${VERSION}.deb
+          cp "$RPM_NAME" pkg/secureexec-agent_linux_amd64_${VERSION}.rpm
+          cp "$KMOD_DEB_NAME" pkg/secureexec-kmod_linux_all_${KMOD_VERSION}.deb
+          cp "$KMOD_RPM_NAME" pkg/secureexec-kmod_linux_noarch_${KMOD_VERSION}.rpm
+
+          docker build \
+            -f docker/agent-files.Dockerfile \
+            --build-arg VERSION="${VERSION}" \
+            -t "$IMAGE" \
+            .
+
+          docker push "$IMAGE"
+          echo "Pushed: $IMAGE"
