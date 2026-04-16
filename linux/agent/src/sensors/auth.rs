@@ -139,6 +139,13 @@ async fn run_auth_log_tail(
                         "linux-auth: auth log grew beyond read cap; skipping oldest bytes"
                     );
                     offset = meta.len() - MAX_CHUNK;
+                    // `carry` holds the tail of a partial line from the
+                    // previous iteration; it is only meaningful when the
+                    // next chunk starts exactly where we stopped. After
+                    // skipping ahead we'd otherwise glue a fragment of an
+                    // old line to the middle of a new one, producing a
+                    // bogus leading log entry.
+                    carry.clear();
                 }
                 let mut file = File::open(&path).await?;
                 file.seek(std::io::SeekFrom::Start(offset)).await?;

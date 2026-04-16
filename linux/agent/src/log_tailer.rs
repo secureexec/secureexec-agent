@@ -10,7 +10,7 @@
 
 use std::path::{Path, PathBuf};
 
-use tokio::io::AsyncBufReadExt;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt};
 use tracing::info;
 
 use secureexec_generic::shutdown::{cancellable_sleep, is_cancelled};
@@ -132,20 +132,33 @@ pub async fn drain_and_clean_script_logs() {
 
         let path = entry.path();
         // Cap each log read to avoid exhausting memory if a runaway script
-        // left behind a multi-GB log file. Anything beyond the cap is
-        // truncated with a marker so operators can still see it happened.
+        // left behind a multi-GB log file. For oversize files we seek to
+        // (file_len - MAX_DRAIN_BYTES) and read only the tail, so memory use
+        // stays bounded regardless of file size.
         const MAX_DRAIN_BYTES: u64 = 8 * 1024 * 1024;
         let content = match tokio::fs::metadata(&path).await {
             Ok(meta) if meta.len() > MAX_DRAIN_BYTES => {
-                match tokio::fs::read(&path).await {
-                    Ok(bytes) => {
-                        let take = bytes.len().saturating_sub((bytes.len() as u64 - MAX_DRAIN_BYTES) as usize);
-                        let tail_start = bytes.len().saturating_sub(take);
-                        let s = String::from_utf8_lossy(&bytes[tail_start..]).to_string();
-                        format!("[log truncated: {} bytes, keeping last {}]\n{}", bytes.len(), take, s)
+                let total = meta.len();
+                let tail_start = total - MAX_DRAIN_BYTES;
+                match tokio::fs::File::open(&path).await {
+                    Ok(mut f) => {
+                        if let Err(e) = f.seek(std::io::SeekFrom::Start(tail_start)).await {
+                            tracing::warn!(path = %path.display(), error = %e, "failed to seek in leftover script log");
+                            continue;
+                        }
+                        let mut buf = Vec::with_capacity(MAX_DRAIN_BYTES as usize);
+                        if let Err(e) = f.take(MAX_DRAIN_BYTES).read_to_end(&mut buf).await {
+                            tracing::warn!(path = %path.display(), error = %e, "failed to read tail of leftover script log");
+                            continue;
+                        }
+                        let s = String::from_utf8_lossy(&buf).to_string();
+                        format!(
+                            "[log truncated: {} bytes total, keeping last {}]\n{}",
+                            total, MAX_DRAIN_BYTES, s
+                        )
                     }
                     Err(e) => {
-                        tracing::warn!(path = %path.display(), error = %e, "failed to read leftover script log");
+                        tracing::warn!(path = %path.display(), error = %e, "failed to open oversize script log");
                         continue;
                     }
                 }

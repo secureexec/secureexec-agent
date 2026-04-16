@@ -3,7 +3,7 @@ use std::io;
 use std::mem::{size_of, MaybeUninit};
 use std::num::NonZeroUsize;
 use std::os::unix::io::RawFd;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -343,6 +343,11 @@ fn respond(fan_fd: RawFd, event_fd: RawFd, response: u32) {
     }
 }
 
+/// Counter incremented whenever a ProcessBlocked event is dropped because the
+/// pipeline channel is saturated. Surfaced separately so operators can alert
+/// on sustained fanotify saturation (which otherwise looks like silence).
+pub static FANOTIFY_EVENTS_DROPPED: AtomicU64 = AtomicU64::new(0);
+
 fn emit_blocked(
     tx: &mpsc::Sender<Event>,
     pid: u32,
@@ -370,9 +375,22 @@ fn emit_blocked(
             cmdline: cmdline.to_string(),
         }),
     );
-    // Use blocking_send because we are in a blocking thread.
-    if let Err(e) = tx.blocking_send(event) {
-        warn!(error = %e, "failed to send ProcessBlocked event");
+    // IMPORTANT: never call `blocking_send` here. This function runs on the
+    // fanotify worker thread; if it stalls, the kernel's fanotify queue fills
+    // up and overflowed events are force-allowed, which would let processes
+    // bypass the blocklist entirely. Prefer dropping the *telemetry* event
+    // over letting the kernel drop permission events.
+    match tx.try_send(event) {
+        Ok(()) => {}
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            let n = FANOTIFY_EVENTS_DROPPED.fetch_add(1, Ordering::Relaxed) + 1;
+            if n.is_power_of_two() {
+                warn!(dropped = n, "fanotify: pipeline channel full — dropping ProcessBlocked events");
+            }
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            warn!("fanotify: pipeline channel closed — dropping ProcessBlocked event");
+        }
     }
 }
 

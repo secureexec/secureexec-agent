@@ -72,14 +72,26 @@ impl Sensor for MacosNetworkSensor {
         if sock_path.exists() {
             let _ = std::fs::remove_file(sock_path);
         }
-        let listener = UnixListener::bind(sock_path).map_err(|e| {
+        // Raise umask so the socket is created with mode 0600 atomically.
+        // Without this, `bind(2)` creates the socket file with the inherited
+        // umask (typically 0022), leaving a small TOCTOU window between
+        // `bind` and the explicit `chmod(0600)` during which an unprivileged
+        // local process could `connect(2)` and inject fake netflow events.
+        //
+        // SAFETY: umask is process-global; we restore it immediately after
+        // bind. Any concurrent thread creating files during this window would
+        // also inherit 0177, which is strictly more restrictive and safe.
+        let prev_umask = unsafe { libc::umask(0o177) };
+        let bind_result = UnixListener::bind(sock_path);
+        unsafe { libc::umask(prev_umask) };
+        let listener = bind_result.map_err(|e| {
             secureexec_generic::error::AgentError::Pipeline(format!(
                 "failed to bind {SOCKET_PATH}: {e}"
             ))
         })?;
-        // Tighten permissions so only the owner (root) can connect. Without
-        // this, `/tmp` being world-writable means any local process could
-        // inject fabricated FlowEvent lines into the agent.
+        // Belt-and-suspenders: also chmod explicitly in case the socket
+        // already existed with wider permissions (shouldn't happen — we
+        // remove_file above — but defensive against racing agent restarts).
         if let Err(e) = std::fs::set_permissions(sock_path, std::fs::Permissions::from_mode(0o600)) {
             warn!(error = %e, "macos-network: failed to chmod socket — continuing but untrusted peers may connect");
         }

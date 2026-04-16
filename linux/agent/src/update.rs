@@ -90,10 +90,25 @@ fn needs_kmod(firewall_backend: &str) -> bool {
     firewall_backend == "kmod" || kmod_is_installed()
 }
 
+/// Stream-hash `path` in 1 MiB chunks and compare against `expected`.
+/// Reading the whole file into memory would OOM the agent on large packages
+/// (kmod debs can be 100+ MiB).
 fn verify_sha256(path: &Path, expected: &str) -> Result<()> {
-    let bytes = std::fs::read(path)
-        .map_err(|e| AgentError::Platform(format!("read file for sha256 verification: {}", e)))?;
-    let actual = hex::encode(Sha256::digest(&bytes));
+    use std::io::Read;
+    let mut f = std::fs::File::open(path)
+        .map_err(|e| AgentError::Platform(format!("open file for sha256 verification: {}", e)))?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 1024 * 1024];
+    loop {
+        let n = f
+            .read(&mut buf)
+            .map_err(|e| AgentError::Platform(format!("read file for sha256 verification: {}", e)))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    let actual = hex::encode(hasher.finalize());
     if !expected.eq_ignore_ascii_case(&actual) {
         Err(AgentError::Platform(format!(
             "sha256 mismatch: expected {}, got {}",
@@ -102,6 +117,30 @@ fn verify_sha256(path: &Path, expected: &str) -> Result<()> {
     } else {
         Ok(())
     }
+}
+
+/// Basic allowlist for a semver-ish version string before it is embedded into
+/// a shell command. The download pipeline places the version inside package
+/// filenames (which we fully control), but `target_version` still originates
+/// from the control plane, so we refuse anything containing shell
+/// metacharacters as defense-in-depth.
+fn validate_target_version(v: &str) -> Result<()> {
+    if v.is_empty() || v.len() > 64 {
+        return Err(AgentError::Platform(format!(
+            "invalid target_version length: {}",
+            v.len()
+        )));
+    }
+    if !v
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '+'))
+    {
+        return Err(AgentError::Platform(format!(
+            "target_version contains unsafe characters: {:?}",
+            v
+        )));
+    }
+    Ok(())
 }
 
 fn clean_updates_dir() {
@@ -130,6 +169,18 @@ impl AgentUpdater for LinuxAgentUpdater {
         expected_sha256: String,
         firewall_backend: String,
     ) -> Result<()> {
+        validate_target_version(&target_version)?;
+
+        // Require a non-empty expected SHA256. An empty value previously
+        // silently skipped verification, which means a compromised control
+        // plane could ship a backdoored package and the agent would install
+        // it unauthenticated. Updates without a hash must be rejected.
+        if expected_sha256.is_empty() {
+            return Err(AgentError::Platform(
+                "refusing agent update: empty expected_sha256 (unauthenticated update)".to_string(),
+            ));
+        }
+
         let platform = detect_platform()?;
         std::fs::create_dir_all(UPDATES_DIR)
             .map_err(|e| AgentError::Platform(format!("create updates dir: {}", e)))?;
@@ -143,21 +194,21 @@ impl AgentUpdater for LinuxAgentUpdater {
         ctrl.download_agent_update(&agent_id, &platform, &target_version, &agent_path)
             .await?;
 
-        if !expected_sha256.is_empty() {
-            let bytes = tokio::fs::read(&agent_path)
-                .await
-                .map_err(|e| AgentError::Platform(format!("read update file for verification: {}", e)))?;
-            let digest = Sha256::digest(&bytes);
-            let actual = hex::encode(digest);
-            if !expected_sha256.eq_ignore_ascii_case(&actual) {
-                error!(component = "agent-update", path = %agent_path.display(), "update package sha256 mismatch");
-                return Err(AgentError::Platform(format!(
-                    "update package sha256 mismatch: expected {}, got {}",
-                    expected_sha256, actual
-                )));
-            }
-            info!(component = "agent-update", "agent package sha256 verified");
+        // Verify against the server-provided digest using a streaming hash so
+        // multi-hundred-MiB update packages don't force us to buffer the
+        // entire file in RAM.
+        let verify_path = agent_path.clone();
+        let verify_expected = expected_sha256.clone();
+        let verify_result = tokio::task::spawn_blocking(move || {
+            verify_sha256(&verify_path, &verify_expected)
+        })
+        .await
+        .map_err(|e| AgentError::Platform(format!("sha256 verify task panicked: {}", e)))?;
+        if let Err(e) = verify_result {
+            error!(component = "agent-update", path = %agent_path.display(), error = %e, "update package sha256 mismatch");
+            return Err(e);
         }
+        info!(component = "agent-update", "agent package sha256 verified");
 
         // --- Conditionally download and verify kmod package ---
         let kmod_path = if needs_kmod(&firewall_backend) {

@@ -18,6 +18,10 @@ const MAX_SPOOL_ROWS: i64 = 2_000_000;
 
 struct EventSpool {
     conn: Connection,
+    /// How many pushes have occurred since the last retention check. We
+    /// amortise the `SELECT COUNT(*)` over many pushes so it is not run on
+    /// every call, which matters when the spool grows large.
+    pushes_since_retention: std::cell::Cell<u32>,
 }
 
 impl EventSpool {
@@ -42,7 +46,10 @@ impl EventSpool {
             info!(pending = count, "spool contains unsent events from previous run");
         }
 
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            pushes_since_retention: std::cell::Cell::new(0),
+        })
     }
 
     fn push(&self, events: &[Event]) -> Result<()> {
@@ -73,6 +80,18 @@ impl EventSpool {
     /// server outages. Eviction is a single `DELETE` with `ORDER BY id`, which
     /// is cheap on a WAL-mode SQLite database.
     fn enforce_retention(&self) {
+        // Amortise `SELECT COUNT(*)` — on a multi-million-row WAL-mode table
+        // it's cheap but not free, and `push` is on the hot path. We check
+        // every 32 pushes (plus push sizes are typically 100+ events, so one
+        // overshoot is at most ~32*batch_size, well below the cap).
+        const RETENTION_CHECK_EVERY: u32 = 32;
+        let n = self.pushes_since_retention.get().wrapping_add(1);
+        if n < RETENTION_CHECK_EVERY {
+            self.pushes_since_retention.set(n);
+            return;
+        }
+        self.pushes_since_retention.set(0);
+
         let count: i64 = self.conn
             .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
             .unwrap_or(0);

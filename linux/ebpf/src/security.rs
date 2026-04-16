@@ -178,6 +178,11 @@ fn try_sys_enter_fchmodat(ctx: &TracePointContext) -> Result<(), i64> {
         event.new_uid = ID_UNCHANGED;
         event.new_gid = ID_UNCHANGED;
         event.comm = bpf_get_current_comm().unwrap_or([0u8; TASK_COMM_LEN]);
+        // Ring buffer memory is reused across events and is NOT zeroed
+        // between reservations; a failed bpf_probe_read_user_str_bytes would
+        // otherwise leave stale bytes from a previous event visible in
+        // event.filename, leaking path fragments across unrelated processes.
+        event.filename[0] = 0;
         unsafe {
             let _ = bpf_probe_read_user_str_bytes(filename_ptr as *const u8, &mut event.filename);
         }
@@ -225,6 +230,9 @@ fn try_sys_enter_chown(ctx: &TracePointContext) -> Result<(), i64> {
         event.new_uid = new_uid;
         event.new_gid = new_gid;
         event.comm = bpf_get_current_comm().unwrap_or([0u8; TASK_COMM_LEN]);
+        // See comment in try_sys_enter_fchmodat: pre-zero the sentinel byte so
+        // a partial/failed read cannot leak bytes from a prior ring event.
+        event.filename[0] = 0;
         unsafe {
             let _ = bpf_probe_read_user_str_bytes(filename_ptr as *const u8, &mut event.filename);
         }
@@ -732,6 +740,12 @@ fn try_sys_enter_symlinkat(ctx: &TracePointContext) -> Result<(), i64> {
         e.uid = bpf_get_current_uid_gid() as u32;
         e._pad2 = 0;
         e.comm = bpf_get_current_comm().unwrap_or([0u8; TASK_COMM_LEN]);
+        // Ring buffer memory is reused. If either pointer is NULL, or a read
+        // fails partway, stale bytes from a prior event would otherwise leak
+        // into the skipped path field. Zero the sentinel byte of both fields
+        // so userspace sees an empty C string on skip/failure.
+        e.src_path[0] = 0;
+        e.dst_path[0] = 0;
         if src_ptr != 0 { unsafe { let _ = bpf_probe_read_user_str_bytes(src_ptr as *const u8, &mut e.src_path); } }
         if dst_ptr != 0 { unsafe { let _ = bpf_probe_read_user_str_bytes(dst_ptr as *const u8, &mut e.dst_path); } }
         buf.submit(0);
@@ -764,6 +778,10 @@ fn try_sys_enter_linkat(ctx: &TracePointContext) -> Result<(), i64> {
         e.uid = bpf_get_current_uid_gid() as u32;
         e._pad2 = 0;
         e.comm = bpf_get_current_comm().unwrap_or([0u8; TASK_COMM_LEN]);
+        // See try_sys_enter_symlinkat: pre-zero both path sentinels to prevent
+        // cross-event path leakage through reused ring buffer memory.
+        e.src_path[0] = 0;
+        e.dst_path[0] = 0;
         if src_ptr != 0 { unsafe { let _ = bpf_probe_read_user_str_bytes(src_ptr as *const u8, &mut e.src_path); } }
         if dst_ptr != 0 { unsafe { let _ = bpf_probe_read_user_str_bytes(dst_ptr as *const u8, &mut e.dst_path); } }
         buf.submit(0);

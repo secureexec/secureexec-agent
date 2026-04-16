@@ -6,7 +6,7 @@ use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
 use serde::Deserialize;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use secureexec_generic::command::{AgentCommand, CommandHandler};
 use secureexec_generic::error::{AgentError, Result};
@@ -291,13 +291,40 @@ impl CommandHandler for LinuxCommandHandler {
                     .ok_or_else(|| AgentError::Platform("kill_process_tree: process table unavailable".into()))?
                     .read()
                     .map_err(|_| AgentError::Platform("kill_process_tree: process table lock poisoned".into()))?
-                    .pids_in_subtree(&ancestor_guid);
+                    .pids_in_subtree_with_start_time(&ancestor_guid);
 
                 info!(ancestor_guid = %ancestor_guid, count = pids.len(), "killing process subtree");
-                for pid in pids {
-                    // Safety: `pid` is a live PID read from the process table,
-                    // which only contains entries observed by the eBPF sensor.
-                    // SIGKILL is safe to send to any process we have permission for.
+                for (pid, expected_start) in pids {
+                    // PID-reuse TOCTOU mitigation: between snapshotting the
+                    // process table and delivering SIGKILL, the original
+                    // process may have exited and the kernel may have reused
+                    // its PID for an unrelated (possibly privileged) task.
+                    // Verify start_time from /proc/<pid>/stat still matches
+                    // what the table recorded — the value is in jiffies and
+                    // is effectively unique per PID instance.
+                    //
+                    // We allow 2s of slop because start_time derivation goes
+                    // through boot_time + jiffies math and can drift slightly
+                    // across samples taken at different moments.
+                    match crate::sensors::procfs::read_proc_start_time(pid) {
+                        Some(actual) => {
+                            let delta = (actual - expected_start).num_milliseconds().abs();
+                            if delta > 2000 {
+                                warn!(
+                                    pid,
+                                    delta_ms = delta,
+                                    "refusing to kill: start_time mismatch (likely PID reuse)"
+                                );
+                                continue;
+                            }
+                        }
+                        None => {
+                            // /proc entry is gone — process has already exited.
+                            debug!(pid, "skip kill: /proc/<pid>/stat missing (already exited)");
+                            continue;
+                        }
+                    }
+
                     if let Err(e) = nix::sys::signal::kill(
                         nix::unistd::Pid::from_raw(pid as i32),
                         nix::sys::signal::Signal::SIGKILL,

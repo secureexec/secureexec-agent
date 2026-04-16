@@ -16,6 +16,7 @@ const MAX_LOG_ROWS: i64 = 500_000;
 
 struct LogSpoolInner {
     conn: Connection,
+    pushes_since_retention: std::cell::Cell<u32>,
 }
 
 impl LogSpoolInner {
@@ -31,7 +32,10 @@ impl LogSpoolInner {
              );",
         )
         .map_err(|e| AgentError::Pipeline(format!("log spool init: {e}")))?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            pushes_since_retention: std::cell::Cell::new(0),
+        })
     }
 
     fn push(&self, entries: &[AgentLogEntry]) -> Result<()> {
@@ -56,6 +60,16 @@ impl LogSpoolInner {
     }
 
     fn enforce_retention(&self) {
+        // Run the COUNT(*) check only every N pushes to keep the hot path
+        // cheap on a large spool. The overshoot is bounded by batch size.
+        const RETENTION_CHECK_EVERY: u32 = 32;
+        let n = self.pushes_since_retention.get().wrapping_add(1);
+        if n < RETENTION_CHECK_EVERY {
+            self.pushes_since_retention.set(n);
+            return;
+        }
+        self.pushes_since_retention.set(0);
+
         let count: i64 = self
             .conn
             .query_row("SELECT COUNT(*) FROM agent_logs", [], |r| r.get(0))

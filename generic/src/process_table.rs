@@ -257,27 +257,56 @@ impl ProcessTable {
     /// `ancestor_guid` — any process whose ancestry cannot be traced to the
     /// requested ancestor is skipped.
     pub fn pids_in_subtree(&self, ancestor_guid: &str) -> Vec<u32> {
-        let live: Vec<&ProcessInfo> = self.processes.values()
-            .filter(|p| p.exit_time.is_none())
-            .collect();
+        self.pids_in_subtree_with_start_time(ancestor_guid)
+            .into_iter()
+            .map(|(pid, _)| pid)
+            .collect()
+    }
 
-        let mut in_tree: std::collections::HashSet<&str> = std::collections::HashSet::new();
-        in_tree.insert(ancestor_guid);
-
-        loop {
-            let before = in_tree.len();
-            for p in &live {
-                if in_tree.contains(p.parent_process_guid.as_str()) {
-                    in_tree.insert(p.process_guid.as_str());
-                }
+    /// Same as [`pids_in_subtree`], but also returns the recorded start time
+    /// for each pid. The caller can re-read `/proc/<pid>/stat` and compare
+    /// start times to detect PID reuse before issuing a `kill(2)`, closing
+    /// the TOCTOU window between lookup and signal delivery.
+    pub fn pids_in_subtree_with_start_time(
+        &self,
+        ancestor_guid: &str,
+    ) -> Vec<(u32, DateTime<Utc>)> {
+        // Build a parent -> children adjacency list in one pass, then do a
+        // standard BFS. The previous implementation was O(N^2 * depth) as it
+        // re-scanned every live process on every expansion pass; on large
+        // tables (think fork-bomb investigations) this became the bottleneck
+        // while holding a read lock on the process table.
+        use std::collections::HashMap;
+        let mut children: HashMap<&str, Vec<&ProcessInfo>> = HashMap::new();
+        let mut root: Option<&ProcessInfo> = None;
+        for p in self.processes.values() {
+            if p.exit_time.is_some() {
+                continue;
             }
-            if in_tree.len() == before { break; }
+            if p.process_guid.as_str() == ancestor_guid {
+                root = Some(p);
+            }
+            children
+                .entry(p.parent_process_guid.as_str())
+                .or_default()
+                .push(p);
         }
 
-        live.iter()
-            .filter(|p| in_tree.contains(p.process_guid.as_str()))
-            .map(|p| p.pid)
-            .collect()
+        let mut out = Vec::new();
+        let mut stack: Vec<&str> = Vec::new();
+        if let Some(r) = root {
+            out.push((r.pid, r.start_time));
+        }
+        stack.push(ancestor_guid);
+        while let Some(guid) = stack.pop() {
+            if let Some(kids) = children.get(guid) {
+                for k in kids {
+                    out.push((k.pid, k.start_time));
+                    stack.push(k.process_guid.as_str());
+                }
+            }
+        }
+        out
     }
 
     pub fn running_count(&self) -> usize {
