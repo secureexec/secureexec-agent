@@ -1,9 +1,11 @@
 use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use aya::Ebpf;
+use lru::LruCache;
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, error, info, warn};
 
@@ -116,7 +118,16 @@ impl Sensor for LinuxEbpfSensor {
             })
             .map_err(|e| AgentError::Platform(format!("failed to spawn ebpf thread: {e}")))?;
 
-        let mut proc_cache: HashMap<u32, procfs::ProcInfo> = HashMap::new();
+        // `proc_cache` is populated on fork/exec and pruned on observed
+        // ProcessExit.  When exit events are lost (SECURITY/PROCESS ring
+        // buffer drops on a busy host) the cache would grow without bound;
+        // use an LRU so the least-recently-touched pids are evicted first
+        // and active processes keep their context across file / network /
+        // security events.  Each `get` in `convert_bpf_events` promotes the
+        // entry, so hot pids stay resident.
+        const PROC_CACHE_CAP: usize = 32 * 1024;
+        let mut proc_cache: LruCache<u32, procfs::ProcInfo> =
+            LruCache::new(NonZeroUsize::new(PROC_CACHE_CAP).unwrap());
         // tgid → (cmdline, ld_preload) buffered from PROC_EVT_ARGV
         let mut pending_argv: HashMap<u32, (String, String)> = HashMap::new();
         let mut exe_hash_cache = exe_hash::ExeHashCache::new();

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
+use lru::LruCache;
 use secureexec_ebpf_common::ID_UNCHANGED;
 use secureexec_generic::event::{
     BpfProgramEvent, CapabilityChangeEvent, DnsEvent, Event, EventKind, FileEvent,
@@ -25,7 +26,7 @@ use super::types::BpfEvent;
 pub(super) fn convert_bpf_events(
     bpf: BpfEvent,
     hostname: &str,
-    cache: &mut HashMap<u32, procfs::ProcInfo>,
+    cache: &mut LruCache<u32, procfs::ProcInfo>,
     pending_argv: &mut HashMap<u32, (String, String)>,
     uid_resolver: &mut procfs::UidResolver,
     exe_hash_cache: &mut exe_hash::ExeHashCache,
@@ -62,9 +63,9 @@ pub(super) fn convert_bpf_events(
                 .unwrap_or(0);
 
             // Emit synthetic snapshot for uncached parent
-            if real_ppid > 0 && !cache.contains_key(&real_ppid) {
+            if real_ppid > 0 && !cache.contains(&real_ppid) {
                 if let Some(parent_info) = procfs::read_proc_info(real_ppid) {
-                    cache.insert(real_ppid, parent_info.clone());
+                    cache.put(real_ppid, parent_info.clone());
                     let parent_username  = uid_resolver.resolve(parent_info.uid, real_ppid);
                     let parent_container = parent_info.container_id.clone().unwrap_or_default();
                     let mut ev = Event::new(hostname.to_string(), EventKind::ProcessCreate(ProcessEvent {
@@ -90,7 +91,7 @@ pub(super) fn convert_bpf_events(
             }
 
             if let Some(ref i) = info {
-                cache.insert(pid, i.clone());
+                cache.put(pid, i.clone());
             }
             let (name, path, proc_cmdline, start_time, container_id) = match info {
                 Some(i) => (i.name, i.path, i.cmdline, i.start_time, i.container_id.unwrap_or_default()),
@@ -122,7 +123,7 @@ pub(super) fn convert_bpf_events(
             return out;
         }
         BpfEvent::ProcessExit { pid, exit_code, comm } => {
-            let cached = cache.remove(&pid);
+            let cached = cache.pop(&pid);
             pending_argv.remove(&pid);
             let (parent_pid_val, uid, name, path, _cmdline, start_time, container_id) = match cached {
                 Some(c) => (c.parent_pid, c.uid, c.name, c.path, c.cmdline, c.start_time, c.container_id.unwrap_or_default()),
@@ -169,7 +170,7 @@ pub(super) fn convert_bpf_events(
             // Cache the child so that a subsequent ProcessExec for a very
             // short-lived process can still recover parent_pid / start_time
             // even if /proc/{pid} has already disappeared.
-            cache.insert(child_pid, procfs::ProcInfo {
+            cache.put(child_pid, procfs::ProcInfo {
                 pid: child_pid,
                 parent_pid,
                 uid: p_uid,
@@ -427,8 +428,11 @@ pub(super) fn convert_bpf_events(
 }
 
 /// Look up process name and start_time from cache, falling back to comm.
+/// Uses `get` (not `peek`) so that every query promotes the entry in the
+/// LRU — long-running processes that are still emitting file/network/
+/// security events stay hot even without any new fork/exec.
 fn lookup_cache(
-    cache: &HashMap<u32, procfs::ProcInfo>,
+    cache: &mut LruCache<u32, procfs::ProcInfo>,
     pid: u32,
     comm: &str,
 ) -> (String, Option<DateTime<Utc>>) {
