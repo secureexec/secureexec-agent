@@ -46,6 +46,25 @@ pub struct ExpectedField {
     pub size:   usize,
 }
 
+impl ExpectedField {
+    /// Field spec for a `sys_enter_*` syscall argument at index `idx`.
+    ///
+    /// On 64-bit kernels every syscall arg is stored at full register width
+    /// (`unsigned long`, 8 bytes), regardless of the C type declaration —
+    /// the slot starts at offset `16 + 8*idx` after the 16-byte common
+    /// header + `__syscall_nr` slot.
+    pub const fn syscall_arg(field: &'static str, idx: usize) -> Self {
+        Self { field, offset: 16 + 8 * idx, size: 8 }
+    }
+
+    /// Field spec for a `__data_loc` field that immediately follows the
+    /// 8-byte common tracepoint header (`__field`-less tracepoints whose
+    /// first declared entry is `__string`/`__data_loc`).
+    pub const fn data_loc(field: &'static str) -> Self {
+        Self { field, offset: 8, size: 4 }
+    }
+}
+
 /// One tracepoint we validate at startup.
 pub struct TracepointSpec {
     /// Name used in log messages (usually the BPF program function name).
@@ -235,35 +254,49 @@ impl TracefsValidator {
 // Validated tracepoints (all programs that use hard-coded ctx.read_at offsets)
 // ---------------------------------------------------------------------------
 
-/// All tracepoints whose raw-buffer offsets are hard-coded in the eBPF programs.
-/// Validated at agent startup; any mismatch is reported as a critical anomaly.
+/// Compact constructor for a `syscalls/<name>` tracepoint spec whose program
+/// name matches `<name>` and whose fields all use the syscall-arg ABI
+/// (offset = 16 + 8*idx, size 8).
+const fn syscall(name: &'static str, fields: &'static [ExpectedField]) -> TracepointSpec {
+    TracepointSpec { program: name, category: "syscalls", name, fields }
+}
+
+/// All tracepoints whose raw-buffer offsets are hard-coded in the eBPF
+/// programs.  Every entry corresponds to an `attach_tracepoint(...)` call in
+/// `loader.rs::load_ebpf` and matches `ctx.read_at(N)` reads in the kernel
+/// program.  Validated at agent startup; any mismatch is reported as a
+/// critical anomaly via the heartbeat counter and structured error log.
 pub const VALIDATED_TRACEPOINTS: &[TracepointSpec] = &[
-    // sched/sched_process_exec — data_loc_filename@8 (u32 data-loc encoding)
+    // ==========================================================
+    // process.rs
+    // ==========================================================
+
+    // sched/sched_process_exec — data_loc filename @ offset 8.
     TracepointSpec {
         program:  "sched_process_exec",
         category: "sched",
         name:     "sched_process_exec",
-        fields:   &[ExpectedField { field: "filename", offset: 8, size: 4 }],
+        fields:   &[ExpectedField::data_loc("filename")],
     },
-    // syscalls/sys_enter_execve — argv@24, envp@32 (filename is captured
-    // separately via sched_process_exec/data_loc, not via ctx.read_at).
+    // sched/sched_process_exit — required for ProcessExit events; we don't
+    // read any field via ctx.read_at, but presence of the tracepoint is
+    // mandatory.  Existence-only validation (empty fields list).
     TracepointSpec {
-        program:  "sys_enter_execve",
-        category: "syscalls",
-        name:     "sys_enter_execve",
-        fields:   &[
-            ExpectedField { field: "argv", offset: 24, size: 8 },
-            ExpectedField { field: "envp", offset: 32, size: 8 },
-        ],
+        program:  "sched_process_exit",
+        category: "sched",
+        name:     "sched_process_exit",
+        fields:   &[],
     },
-    // syscalls/sys_enter_exit_group — error_code@16
-    TracepointSpec {
-        program:  "sys_enter_exit_group",
-        category: "syscalls",
-        name:     "sys_enter_exit_group",
-        fields:   &[ExpectedField { field: "error_code", offset: 16, size: 4 }],
-    },
-    // task/task_newtask — pid@8, comm@12, clone_flags@32
+    syscall("sys_enter_execve", &[
+        ExpectedField::syscall_arg("argv", 1),
+        ExpectedField::syscall_arg("envp", 2),
+    ]),
+    syscall("sys_enter_exit_group", &[
+        ExpectedField::syscall_arg("error_code", 0),
+    ]),
+    // task/task_newtask — non-syscall tracepoint with a custom layout.
+    // pid@8 (size 4), comm[16]@12 (size 16), then 4 bytes of padding to
+    // align clone_flags as `unsigned long` at offset 32.
     TracepointSpec {
         program:  "task_newtask",
         category: "task",
@@ -273,6 +306,146 @@ pub const VALIDATED_TRACEPOINTS: &[TracepointSpec] = &[
             ExpectedField { field: "comm",        offset: 12, size: 16 },
             ExpectedField { field: "clone_flags", offset: 32, size: 8  },
         ],
+    },
+
+    // ==========================================================
+    // file.rs
+    // ==========================================================
+
+    syscall("sys_enter_openat", &[
+        ExpectedField::syscall_arg("filename", 1),
+        ExpectedField::syscall_arg("flags",    2),
+    ]),
+    syscall("sys_enter_unlinkat", &[
+        ExpectedField::syscall_arg("pathname", 1),
+    ]),
+    syscall("sys_enter_renameat2", &[
+        ExpectedField::syscall_arg("oldname", 1),
+        ExpectedField::syscall_arg("newname", 3),
+    ]),
+
+    // ==========================================================
+    // network.rs (tracepoints; kprobe symbol presence is enforced
+    // implicitly by the program load + attach phase)
+    // ==========================================================
+
+    syscall("sys_enter_sendto", &[
+        ExpectedField::syscall_arg("buff", 1),
+        ExpectedField::syscall_arg("len",  2),
+        ExpectedField::syscall_arg("addr", 4),
+    ]),
+    syscall("sys_enter_sendmsg", &[
+        ExpectedField::syscall_arg("msg", 1),
+    ]),
+    syscall("sys_enter_sendmmsg", &[
+        ExpectedField::syscall_arg("mmsg", 1),
+        ExpectedField::syscall_arg("vlen", 2),
+    ]),
+
+    // ==========================================================
+    // security.rs
+    // ==========================================================
+
+    // privilege transitions
+    syscall("sys_enter_setuid",    &[ExpectedField::syscall_arg("uid", 0)]),
+    syscall("sys_enter_setgid",    &[ExpectedField::syscall_arg("gid", 0)]),
+    syscall("sys_enter_setreuid",  &[
+        ExpectedField::syscall_arg("ruid", 0),
+        ExpectedField::syscall_arg("euid", 1),
+    ]),
+    syscall("sys_enter_setregid",  &[
+        ExpectedField::syscall_arg("rgid", 0),
+        ExpectedField::syscall_arg("egid", 1),
+    ]),
+    syscall("sys_enter_setresuid", &[
+        ExpectedField::syscall_arg("ruid", 0),
+        ExpectedField::syscall_arg("euid", 1),
+        ExpectedField::syscall_arg("suid", 2),
+    ]),
+    syscall("sys_enter_setresgid", &[
+        ExpectedField::syscall_arg("rgid", 0),
+        ExpectedField::syscall_arg("egid", 1),
+        ExpectedField::syscall_arg("sgid", 2),
+    ]),
+    // process inspection / control
+    syscall("sys_enter_ptrace", &[
+        ExpectedField::syscall_arg("request", 0),
+        ExpectedField::syscall_arg("pid",     1),
+    ]),
+    syscall("sys_enter_process_vm_readv",  &[ExpectedField::syscall_arg("pid", 0)]),
+    syscall("sys_enter_process_vm_writev", &[ExpectedField::syscall_arg("pid", 0)]),
+    syscall("sys_enter_kill", &[
+        ExpectedField::syscall_arg("pid", 0),
+        ExpectedField::syscall_arg("sig", 1),
+    ]),
+    // file-permission / ownership / linking
+    syscall("sys_enter_fchmodat", &[
+        ExpectedField::syscall_arg("filename", 1),
+        ExpectedField::syscall_arg("mode",     2),
+    ]),
+    syscall("sys_enter_chown", &[
+        ExpectedField::syscall_arg("filename", 0),
+        ExpectedField::syscall_arg("user",     1),
+        ExpectedField::syscall_arg("group",    2),
+    ]),
+    syscall("sys_enter_lchown", &[
+        ExpectedField::syscall_arg("filename", 0),
+        ExpectedField::syscall_arg("user",     1),
+        ExpectedField::syscall_arg("group",    2),
+    ]),
+    syscall("sys_enter_symlinkat", &[
+        ExpectedField::syscall_arg("oldname", 0),
+        ExpectedField::syscall_arg("newname", 2),
+    ]),
+    syscall("sys_enter_linkat", &[
+        ExpectedField::syscall_arg("oldname", 1),
+        ExpectedField::syscall_arg("newname", 3),
+    ]),
+    // memory / capabilities
+    syscall("sys_enter_mmap", &[
+        ExpectedField::syscall_arg("addr",  0),
+        ExpectedField::syscall_arg("len",   1),
+        ExpectedField::syscall_arg("prot",  2),
+        ExpectedField::syscall_arg("flags", 3),
+    ]),
+    syscall("sys_enter_memfd_create", &[
+        ExpectedField::syscall_arg("uname", 0),
+        ExpectedField::syscall_arg("flags", 1),
+    ]),
+    syscall("sys_enter_capset", &[
+        ExpectedField::syscall_arg("header", 0),
+        ExpectedField::syscall_arg("data",   1),
+    ]),
+    // namespaces / mount
+    syscall("sys_enter_unshare", &[
+        ExpectedField::syscall_arg("unshare_flags", 0),
+    ]),
+    syscall("sys_enter_setns", &[
+        ExpectedField::syscall_arg("fd",     0),
+        ExpectedField::syscall_arg("nstype", 1),
+    ]),
+    syscall("sys_enter_mount", &[
+        ExpectedField::syscall_arg("dev_name", 0),
+        ExpectedField::syscall_arg("dir_name", 1),
+        ExpectedField::syscall_arg("type",     2),
+        ExpectedField::syscall_arg("flags",    3),
+    ]),
+    syscall("sys_enter_umount", &[
+        ExpectedField::syscall_arg("name",  0),
+        ExpectedField::syscall_arg("flags", 1),
+    ]),
+    // misc
+    syscall("sys_enter_bpf",            &[ExpectedField::syscall_arg("cmd",     0)]),
+    syscall("sys_enter_keyctl",         &[ExpectedField::syscall_arg("option",  0)]),
+    syscall("sys_enter_io_uring_setup", &[ExpectedField::syscall_arg("entries", 0)]),
+    // module/module_load — `taints` is `__field` first, then `name` is
+    // `__data_loc` at offset 12.  This was previously read at offset 8 in
+    // security.rs (a bug); the eBPF program now reads at 12 to match.
+    TracepointSpec {
+        program:  "module_load",
+        category: "module",
+        name:     "module_load",
+        fields:   &[ExpectedField { field: "name", offset: 12, size: 4 }],
     },
 ];
 
@@ -494,5 +667,142 @@ print fmt: \"filename: 0x%08lx, argv: 0x%08lx, envp: 0x%08lx\", ((unsigned long)
         ]);
         assert!(r.is_empty(), "{:?}",
                 r.iter().map(|m| (&m.field, m.reason)).collect::<Vec<_>>());
+    }
+
+    // -----------------------------------------------------------------------
+    // Helpers + new spec coverage
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn syscall_arg_helper_offsets_and_size() {
+        // Mirrors the kernel ABI: arg N at offset 16 + 8*N, size 8.
+        let cases: &[(usize, usize)] = &[
+            (0, 16), (1, 24), (2, 32), (3, 40), (4, 48), (5, 56),
+        ];
+        for &(idx, expected_off) in cases {
+            let f = ExpectedField::syscall_arg("x", idx);
+            assert_eq!(f.offset, expected_off, "idx {idx}");
+            assert_eq!(f.size,   8,            "idx {idx}");
+            assert_eq!(f.field,  "x");
+        }
+    }
+
+    #[test]
+    fn data_loc_helper_constants() {
+        let f = ExpectedField::data_loc("filename");
+        assert_eq!(f.offset, 8);
+        assert_eq!(f.size,   4);
+        assert_eq!(f.field,  "filename");
+    }
+
+    #[test]
+    fn data_loc_at_offset_12_validates_against_module_load_layout() {
+        // module/module_load: __field unsigned int taints @8, then
+        // __data_loc char[] name @12.  Asserts the validator catches the
+        // pre-fix bug (reading at 8) by reporting offset_mismatch when a
+        // spec wrongly puts `name` at offset 8.
+        let body = "name: module_load\nID: 1\nformat:\n\
+\tfield:unsigned int taints;\toffset:8;\tsize:4;\tsigned:0;\n\
+\tfield:__data_loc char[] name;\toffset:12;\tsize:4;\tsigned:0;\n";
+        let dir = make_tracefs(&[("module", "module_load", body)]);
+        let v = validator_with_base(dir.path().to_path_buf());
+
+        // Buggy spec — should fire offset_mismatch.
+        let r = v.validate_all(&[
+            TracepointSpec {
+                program:  "module_load",
+                category: "module",
+                name:     "module_load",
+                fields:   &[ExpectedField { field: "name", offset: 8, size: 4 }],
+            },
+        ]);
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].reason,        "offset_mismatch");
+        assert_eq!(r[0].actual_offset, Some(12));
+
+        // Correct spec — no mismatches.
+        let r = v.validate_all(&[
+            TracepointSpec {
+                program:  "module_load",
+                category: "module",
+                name:     "module_load",
+                fields:   &[ExpectedField { field: "name", offset: 12, size: 4 }],
+            },
+        ]);
+        assert!(r.is_empty(), "{:?}",
+                r.iter().map(|m| (&m.field, m.reason)).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn existence_only_spec_passes_when_format_present() {
+        // sched_process_exit is in VALIDATED_TRACEPOINTS with `fields: &[]` —
+        // the validator must not complain as long as the format file exists.
+        let body = "name: sched_process_exit\nID: 1\nformat:\n\
+\tfield:char comm[16];\toffset:8;\tsize:16;\tsigned:0;\n\
+\tfield:pid_t pid;\toffset:24;\tsize:4;\tsigned:1;\n\
+\tfield:int prio;\toffset:28;\tsize:4;\tsigned:1;\n";
+        let dir = make_tracefs(&[("sched", "sched_process_exit", body)]);
+        let v = validator_with_base(dir.path().to_path_buf());
+        let r = v.validate_all(&[
+            TracepointSpec {
+                program:  "sched_process_exit",
+                category: "sched",
+                name:     "sched_process_exit",
+                fields:   &[],
+            },
+        ]);
+        assert!(r.is_empty(), "{:?}",
+                r.iter().map(|m| (&m.field, m.reason)).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn existence_only_spec_fires_when_format_missing() {
+        let dir = make_tracefs(&[]);
+        let v = validator_with_base(dir.path().to_path_buf());
+        let r = v.validate_all(&[
+            TracepointSpec {
+                program:  "sched_process_exit",
+                category: "sched",
+                name:     "sched_process_exit",
+                fields:   &[],
+            },
+        ]);
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].reason, "tracepoint_missing");
+        assert_eq!(r[0].label,  "sched_process_exit");
+    }
+
+    #[test]
+    fn syscall_helper_validates_against_realistic_format() {
+        // Realistic sys_enter_kill format: pid@16 (size 8), sig@24 (size 8).
+        const KILL_FIELDS: &[ExpectedField] = &[
+            ExpectedField::syscall_arg("pid", 0),
+            ExpectedField::syscall_arg("sig", 1),
+        ];
+        const KILL_SPEC: TracepointSpec = syscall("sys_enter_kill", KILL_FIELDS);
+
+        let body = "name: sys_enter_kill\nID: 1\nformat:\n\
+\tfield:int __syscall_nr;\toffset:8;\tsize:4;\tsigned:1;\n\
+\tfield:pid_t pid;\toffset:16;\tsize:8;\tsigned:0;\n\
+\tfield:int sig;\toffset:24;\tsize:8;\tsigned:0;\n";
+        let dir = make_tracefs(&[("syscalls", "sys_enter_kill", body)]);
+        let v = validator_with_base(dir.path().to_path_buf());
+        let r = v.validate_all(std::slice::from_ref(&KILL_SPEC));
+        assert!(r.is_empty(), "{:?}",
+                r.iter().map(|m| (&m.field, m.reason)).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn validated_tracepoints_is_well_formed() {
+        // Sanity-check the constant: every entry has program == name and
+        // every field offset/size is plausible (size > 0, offset >= 8).
+        for spec in VALIDATED_TRACEPOINTS {
+            assert!(!spec.name.is_empty(),     "empty name for {}", spec.program);
+            assert!(!spec.category.is_empty(), "empty category for {}", spec.program);
+            for f in spec.fields {
+                assert!(f.size > 0,    "{} field {}: size==0", spec.program, f.field);
+                assert!(f.offset >= 8, "{} field {}: offset {} < 8", spec.program, f.field, f.offset);
+            }
+        }
     }
 }

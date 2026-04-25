@@ -301,8 +301,12 @@ pub fn module_load(ctx: TracePointContext) -> u32 {
 }
 
 fn try_module_load(ctx: &TracePointContext) -> Result<(), i64> {
-    // module_load tracepoint: __data_loc char[] name offset:8 size:4
-    let data_loc: u32 = unsafe { ctx.read_at(8).unwrap_or(0) };
+    // module/module_load tracepoint format (TRACE_EVENT in <trace/events/module.h>):
+    //   field:unsigned int        taints;  offset:8;  size:4;
+    //   field:__data_loc char[]   name;    offset:12; size:4;
+    // The name's data_loc lives at offset 12 — reading offset 8 returns
+    // `taints` and yields garbage when masked as a data_loc encoding.
+    let data_loc: u32 = unsafe { ctx.read_at(12).unwrap_or(0) };
     let name_offset = (data_loc & 0xFFFF) as usize;
 
     let mut name = [0u8; MAX_FILENAME];
