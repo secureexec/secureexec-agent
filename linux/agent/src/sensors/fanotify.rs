@@ -75,6 +75,12 @@ struct HashKey {
     dev: u64,
     ino: u64,
     mtime_ns: i64,
+    // ctime is updated by the kernel on every metadata change and is not
+    // settable from userspace (unlike mtime, which `utimensat` can rewind).
+    // Including it here prevents an attacker from swapping file content and
+    // restoring mtime/size to recover a stale "benign" cache entry. Mirrors
+    // the (dev, ino, mtime, ctime, size) key used by exe_hash.rs.
+    ctime_ns: i64,
     size: u64,
 }
 
@@ -197,13 +203,23 @@ fn fanotify_loop(
     shutdown: Arc<AtomicBool>,
 ) -> Result<()> {
     let fan_fd = init_fanotify().map_err(|e| AgentError::Platform(format!("fanotify_init: {e}")))?;
-    mark_filesystem(fan_fd).map_err(|e| {
+
+    // Mark "/" first so the rootfs is always covered, then walk
+    // /proc/self/mountinfo and mark every other unique super_block we
+    // can. FAN_MARK_FILESYSTEM scopes to a single super_block, so a
+    // single mark on "/" leaves /home, /tmp on tmpfs, container overlay
+    // mounts, bind-mounted volumes on a different fs, etc. invisible to
+    // the blocklist. Failure to mark "/" is fatal; failures for other
+    // mounts (pseudo filesystems, unmounted-by-the-time-we-got-there)
+    // are logged and skipped.
+    if let Err(e) = mark_path_filesystem(fan_fd, "/") {
         // SAFETY: fan_fd is a valid fd created by fanotify_init above.
         unsafe { libc::close(fan_fd) };
-        AgentError::Platform(format!("fanotify_mark: {e}"))
-    })?;
+        return Err(AgentError::Platform(format!("fanotify_mark(/): {e}")));
+    }
+    let extra = mark_all_mounted_filesystems(fan_fd);
 
-    info!("fanotify sensor started (FAN_OPEN_EXEC_PERM on '/')");
+    info!(extra_mounts = extra, "fanotify sensor started (FAN_OPEN_EXEC_PERM on all filesystems)");
 
     // Safety: HASH_CACHE_CAP is a non-zero constant.
     let cap = NonZeroUsize::new(HASH_CACHE_CAP).unwrap();
@@ -407,10 +423,12 @@ fn init_fanotify() -> io::Result<RawFd> {
     Ok(fd as RawFd)
 }
 
-fn mark_filesystem(fan_fd: RawFd) -> io::Result<()> {
-    // Mark the root mount so all exec events are captured.
-    let path = b"/\0";
-    // SAFETY: all args are valid; path is a null-terminated C string.
+/// Mark the super_block containing `path` with `FAN_OPEN_EXEC_PERM`.
+/// `path` must not contain interior NUL bytes.
+fn mark_path_filesystem(fan_fd: RawFd, path: &str) -> io::Result<()> {
+    let cpath = std::ffi::CString::new(path)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "interior NUL in path"))?;
+    // SAFETY: all args are valid; cpath is a null-terminated C string.
     let ret = unsafe {
         libc::syscall(
             libc::SYS_fanotify_mark,
@@ -418,13 +436,169 @@ fn mark_filesystem(fan_fd: RawFd) -> io::Result<()> {
             FAN_MARK_ADD | FAN_MARK_FILESYSTEM,
             FAN_OPEN_EXEC_PERM,
             AT_FDCWD,
-            path.as_ptr(),
+            cpath.as_ptr(),
         )
     };
     if ret < 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+/// Walk `/proc/self/mountinfo` and `FAN_MARK_FILESYSTEM` every unique
+/// super_block we find a real, on-disk-style mount for. Pseudo
+/// filesystems (proc, sysfs, cgroup, debugfs, …) are skipped because
+/// they can't host an executable and the kernel rejects fanotify marks
+/// on most of them anyway. Returns the number of additional super_blocks
+/// (beyond `/`) that were successfully marked, for logging.
+///
+/// Dedupe is by `st_dev` of the mount point: many mounts can share a
+/// super_block (bind mounts, btrfs subvolumes), and FAN_MARK_FILESYSTEM
+/// scopes to the super_block — marking the same one twice is wasteful
+/// log noise.
+fn mark_all_mounted_filesystems(fan_fd: RawFd) -> usize {
+    let mountinfo = match std::fs::read_to_string("/proc/self/mountinfo") {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(error = %e, "fanotify: cannot read /proc/self/mountinfo; only / is marked");
+            return 0;
+        }
+    };
+
+    let mut seen_dev: HashMap<u64, ()> = HashMap::new();
+    // Seed with the rootfs dev so we don't redundantly re-mark "/".
+    if let Ok(meta) = std::fs::metadata("/") {
+        use std::os::unix::fs::MetadataExt;
+        seen_dev.insert(meta.dev(), ());
+    }
+
+    let mut marked = 0usize;
+    for line in mountinfo.lines() {
+        // Format (per `proc(5)` mountinfo):
+        //   mount_id parent_id major:minor root mount_point mount_options
+        //     optional_fields - fs_type mount_source super_options
+        // We need fields 5 (mount_point, 0-indexed: 4) and 9 (fs_type,
+        // after the "-" separator).
+        let mut parts = line.split(' ');
+        let _mount_id = parts.next();
+        let _parent_id = parts.next();
+        let _devnum   = parts.next();
+        let _root     = parts.next();
+        let mount_point_raw = match parts.next() {
+            Some(p) => p,
+            None => continue,
+        };
+        // Skip past mount_options + optional_fields up to the "-" separator.
+        let _mount_opts = parts.next();
+        let mut found_sep = false;
+        for p in parts.by_ref() {
+            if p == "-" {
+                found_sep = true;
+                break;
+            }
+        }
+        if !found_sep {
+            continue;
+        }
+        let fs_type = match parts.next() {
+            Some(t) => t,
+            None => continue,
+        };
+
+        if is_pseudo_fs(fs_type) {
+            continue;
+        }
+
+        let mount_point = unescape_mountinfo(mount_point_raw);
+
+        // Resolve the mount point's super_block by stat'ing it. Use
+        // `metadata` (follows symlinks) on the mount point itself.
+        use std::os::unix::fs::MetadataExt;
+        let dev = match std::fs::metadata(&mount_point) {
+            Ok(m) => m.dev(),
+            Err(_) => continue,
+        };
+        if seen_dev.contains_key(&dev) {
+            continue;
+        }
+
+        match mark_path_filesystem(fan_fd, &mount_point) {
+            Ok(()) => {
+                seen_dev.insert(dev, ());
+                marked += 1;
+                debug!(mount = %mount_point, fs_type, "fanotify: marked filesystem");
+            }
+            Err(e) => {
+                debug!(mount = %mount_point, fs_type, error = %e,
+                       "fanotify: skipping mount (mark failed)");
+            }
+        }
+    }
+    marked
+}
+
+/// Pseudo / kernel-virtual filesystems that can't host executable files
+/// or that the kernel refuses to mark with fanotify. Skipping them keeps
+/// the startup log clean and avoids wasting marks.
+fn is_pseudo_fs(fs_type: &str) -> bool {
+    matches!(
+        fs_type,
+        "proc"
+            | "sysfs"
+            | "cgroup"
+            | "cgroup2"
+            | "devpts"
+            | "devtmpfs"
+            | "mqueue"
+            | "pstore"
+            | "bpf"
+            | "tracefs"
+            | "debugfs"
+            | "securityfs"
+            | "configfs"
+            | "fusectl"
+            | "hugetlbfs"
+            | "rpc_pipefs"
+            | "nsfs"
+            | "binfmt_misc"
+            | "autofs"
+            | "ramfs"
+            | "selinuxfs"
+            | "fuse.gvfsd-fuse"
+    )
+}
+
+/// Decode the kernel's mountinfo escape sequences (`\040`, `\011`,
+/// `\012`, `\134`) back into their literal characters.
+fn unescape_mountinfo(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            // Try to read 3 octal digits.
+            let mut octal = String::new();
+            for _ in 0..3 {
+                match chars.peek() {
+                    Some(d) if d.is_ascii_digit() => {
+                        octal.push(*d);
+                        chars.next();
+                    }
+                    _ => break,
+                }
+            }
+            if octal.len() == 3 {
+                if let Ok(byte) = u8::from_str_radix(&octal, 8) {
+                    out.push(byte as char);
+                    continue;
+                }
+            }
+            out.push('\\');
+            out.push_str(&octal);
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// `poll()` a single fd for POLLIN.  Returns the number of ready fds (0 = timeout, <0 = error).
@@ -441,7 +615,7 @@ fn read_fd_path(fd: RawFd) -> Option<String> {
 }
 
 /// Compute (or look up cached) SHA-256 hash + file size for an open fd.
-/// Uses `(dev, ino, mtime_ns, size)` as the cache key.
+/// Uses `(dev, ino, mtime_ns, ctime_ns, size)` as the cache key.
 fn hash_from_fd(fd: RawFd, cache: &mut LruCache<HashKey, (String, u64)>) -> (String, u64) {
     // stat the fd.
     let mut stat: MaybeUninit<libc::stat64> = MaybeUninit::uninit();
@@ -457,6 +631,7 @@ fn hash_from_fd(fd: RawFd, cache: &mut LruCache<HashKey, (String, u64)>) -> (Str
         dev: stat.st_dev as u64,
         ino: stat.st_ino as u64,
         mtime_ns: stat.st_mtime * 1_000_000_000 + stat.st_mtime_nsec,
+        ctime_ns: stat.st_ctime * 1_000_000_000 + stat.st_ctime_nsec,
         size: stat.st_size as u64,
     };
     let file_size = stat.st_size as u64;

@@ -3,7 +3,7 @@ use tokio::sync::{mpsc, watch};
 use tracing::{debug, warn};
 
 use secureexec_generic::error::Result;
-use secureexec_generic::event::{Event, EventKind, FileEvent};
+use secureexec_generic::event::Event;
 use secureexec_generic::sensor::Sensor;
 
 /// File-system sensor for Windows.
@@ -26,34 +26,15 @@ impl Sensor for WindowsFileSensor {
         "windows-file"
     }
 
-    async fn run(&self, tx: mpsc::Sender<Event>, mut cancel: watch::Receiver<bool>) -> Result<()> {
-        let hostname = hostname::get()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|_| "unknown".into());
-
-        loop {
-            tokio::select! {
-                _ = cancel.changed() => {
-                    debug!("windows-file sensor stopping");
-                    return Ok(());
-                }
-                _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {
-                    warn!("windows-file: stub — no real minifilter / ETW integration yet");
-
-                    let event = Event::new(
-                        hostname.clone(),
-                        EventKind::FileCreate(FileEvent {
-                            path: r"C:\Temp\stub.txt".into(),
-                            pid: 0,
-                            process_name: "stub.exe".into(),
-                            process_guid: String::new(),
-                            process_start_time: None,
-                            user_id: String::new(),
-                        }),
-                    );
-                    let _ = tx.send(event).await;
-                }
-            }
-        }
+    async fn run(&self, _tx: mpsc::Sender<Event>, mut cancel: watch::Receiver<bool>) -> Result<()> {
+        // Stub: emit a single startup warning so operators see the sensor
+        // isn't implemented, then idle until cancelled. We deliberately do
+        // NOT push synthetic events into the pipeline — fake telemetry
+        // would pollute the backend with bogus FileCreate events that look
+        // exactly like the indicators a backend would alert on.
+        warn!("windows-file: stub — no real minifilter / ETW integration yet; sensor idle");
+        let _ = cancel.changed().await;
+        debug!("windows-file sensor stopping");
+        Ok(())
     }
 }

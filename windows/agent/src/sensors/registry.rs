@@ -3,7 +3,7 @@ use tokio::sync::{mpsc, watch};
 use tracing::{debug, warn};
 
 use secureexec_generic::error::Result;
-use secureexec_generic::event::{Event, EventKind, RegistryEvent};
+use secureexec_generic::event::Event;
 use secureexec_generic::sensor::Sensor;
 
 /// Windows-only registry sensor.
@@ -26,34 +26,14 @@ impl Sensor for WindowsRegistrySensor {
         "windows-registry"
     }
 
-    async fn run(&self, tx: mpsc::Sender<Event>, mut cancel: watch::Receiver<bool>) -> Result<()> {
-        let hostname = hostname::get()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|_| "unknown".into());
-
-        loop {
-            tokio::select! {
-                _ = cancel.changed() => {
-                    debug!("windows-registry sensor stopping");
-                    return Ok(());
-                }
-                _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {
-                    warn!("windows-registry: stub — no real registry monitoring yet");
-
-                    let event = Event::new(
-                        hostname.clone(),
-                        EventKind::RegistryWrite(RegistryEvent {
-                            pid: 0,
-                            process_name: "stub.exe".into(),
-                            process_guid: String::new(),
-                            process_start_time: None,
-                            key: r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run".into(),
-                            value_name: "StubEntry".into(),
-                        }),
-                    );
-                    let _ = tx.send(event).await;
-                }
-            }
-        }
+    async fn run(&self, _tx: mpsc::Sender<Event>, mut cancel: watch::Receiver<bool>) -> Result<()> {
+        // Stub: warn once, then idle until cancelled.  Synthetic
+        // RegistryWrite events (e.g. to HKLM\...\CurrentVersion\Run) match
+        // common persistence indicators and would trigger false-positive
+        // alerts on any backend that monitors autorun keys.
+        warn!("windows-registry: stub — no real registry monitoring yet; sensor idle");
+        let _ = cancel.changed().await;
+        debug!("windows-registry sensor stopping");
+        Ok(())
     }
 }

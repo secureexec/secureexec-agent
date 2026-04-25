@@ -27,6 +27,10 @@ use secureexec_generic::error::{AgentError, Result};
 
 use crate::firewall::{NetworkFirewall, SeFwRule, SE_FW_DIR_IN, SE_FW_DIR_OUT, SE_FW_PROTO_UDP};
 
+/// Maximum number of rules the FW_RULES BPF map can hold. Must match the
+/// `HashMap::with_max_entries(64, 0)` declaration on the eBPF side.
+const FW_RULES_CAP: usize = 64;
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -125,27 +129,34 @@ impl EbpfFirewall {
             info!("ebpf-firewall: netlink interface watcher started");
 
             loop {
-                // We use a blocking task for the recv() so we don't block the
-                // async executor.  The socket fd is valid for the lifetime of
-                // the spawned blocking closure.
+                // Each blocking iteration polls the netlink fd with a short
+                // timeout and then either reads one message or returns
+                // `RecvOutcome::Timeout`. This bounds the lifetime of the
+                // blocking task so cancel propagates within ~500 ms.
+                // Previously `recv_rtm_link_event` blocked forever, and
+                // because dropping a `spawn_blocking` JoinHandle does NOT
+                // abort the underlying thread, every shutdown leaked one
+                // worker stuck in `recv()` until a netlink message arrived.
                 let fd = socket.as_raw_fd();
                 let result = tokio::select! {
                     _ = cancel.changed() => {
                         debug!("ebpf-firewall: interface watcher stopping");
                         return;
                     }
-                    r = tokio::task::spawn_blocking(move || recv_rtm_link_event(fd)) => r
+                    r = tokio::task::spawn_blocking(move || {
+                        recv_rtm_link_event(fd, IFACE_WATCHER_POLL_MS)
+                    }) => r
                 };
 
                 match result {
-                    Ok(Some(NetlinkIfaceEvent::Del(ref name))) => {
+                    Ok(RecvOutcome::Event(NetlinkIfaceEvent::Del(ref name))) => {
                         if let Ok(mut set) = attached.lock() {
                             if set.remove(name) {
                                 debug!("ebpf-firewall: interface {name} removed, cleared from attached set");
                             }
                         }
                     }
-                    Ok(Some(NetlinkIfaceEvent::New(ref name))) => {
+                    Ok(RecvOutcome::Event(NetlinkIfaceEvent::New(ref name))) => {
                         if name == "lo" {
                             continue;
                         }
@@ -160,6 +171,8 @@ impl EbpfFirewall {
                             }
                         }
                     }
+                    // Timeout / non-link message / decode failure: just loop;
+                    // the next iteration's `select!` checks cancel.
                     _ => {}
                 }
             }
@@ -184,24 +197,56 @@ impl NetworkFirewall for EbpfFirewall {
             .lock()
             .map_err(|_| AgentError::Platform("ebpf fw_rules mutex poisoned".into()))?;
 
-        // Clear existing rules.
-        let existing: Vec<FwRuleKey> = rules_map
-            .keys()
-            .filter_map(|r: std::result::Result<FwRuleKey, _>| r.ok())
-            .collect();
-        for key in existing {
-            let _ = rules_map.remove(&key);
-        }
-
         let default_rules: &[SeFwRule] = &[
             SeFwRule { ip: 0, port: 53, proto: SE_FW_PROTO_UDP, direction: SE_FW_DIR_IN },
             SeFwRule { ip: 0, port: 53, proto: SE_FW_PROTO_UDP, direction: SE_FW_DIR_OUT },
         ];
 
-        for rule in default_rules.iter().chain(extra_rules.iter()) {
-            rules_map
-                .insert(sefwrule_to_fwrulekey(rule), 1u8, 0)
-                .map_err(|e| AgentError::Platform(format!("ebpf: insert rule: {e}")))?;
+        // Build the deduped desired rule set up-front so we can pre-validate
+        // capacity before mutating any state. The previous implementation
+        // cleared the map first and then inserted rules one-by-one — if any
+        // insert failed (e.g. overflow past the 64-entry cap, or a
+        // re-isolation racing with another writer) the host was left in
+        // ISOLATED mode with a *partial* allowlist, which can lock the
+        // agent out of its own backend.
+        let mut desired: Vec<FwRuleKey> = default_rules
+            .iter()
+            .chain(extra_rules.iter())
+            .map(sefwrule_to_fwrulekey)
+            .collect();
+        desired.sort_by(fwrulekey_order);
+        desired.dedup();
+
+        if desired.len() > FW_RULES_CAP {
+            return Err(AgentError::Platform(format!(
+                "ebpf: refusing to isolate — rule count {} exceeds cap {}",
+                desired.len(),
+                FW_RULES_CAP
+            )));
+        }
+
+        // Snapshot the current ruleset so we can roll back on failure
+        // without leaving the host with a partial allowlist.
+        let existing: Vec<FwRuleKey> = rules_map
+            .keys()
+            .filter_map(|r: std::result::Result<FwRuleKey, _>| r.ok())
+            .collect();
+
+        if let Err(e) = apply_ruleset(&mut rules_map, &existing, &desired) {
+            // Rollback: best-effort restore of the snapshot.
+            let current: Vec<FwRuleKey> = rules_map
+                .keys()
+                .filter_map(|r: std::result::Result<FwRuleKey, _>| r.ok())
+                .collect();
+            for key in &current {
+                let _ = rules_map.remove(key);
+            }
+            for key in &existing {
+                let _ = rules_map.insert(key, &1u8, 0);
+            }
+            return Err(AgentError::Platform(format!(
+                "ebpf: insert rule failed, rolled back: {e}"
+            )));
         }
 
         self.fw_mode
@@ -210,7 +255,7 @@ impl NetworkFirewall for EbpfFirewall {
             .set(0, FW_MODE_ISOLATED, 0)
             .map_err(|e| AgentError::Platform(format!("ebpf: set FW_MODE: {e}")))?;
 
-        info!("firewall(ebpf): host isolated ({} rules)", default_rules.len() + extra_rules.len());
+        info!("firewall(ebpf): host isolated ({} rules)", desired.len());
         Ok(())
     }
 
@@ -262,6 +307,40 @@ fn sefwrule_to_fwrulekey(r: &SeFwRule) -> FwRuleKey {
         _ => 0,
     };
     FwRuleKey { ip: r.ip, port: r.port, proto: r.proto, direction }
+}
+
+/// Total ordering on `FwRuleKey` so we can sort+dedup the desired rule set
+/// without requiring `Ord` on the upstream type.
+fn fwrulekey_order(a: &FwRuleKey, b: &FwRuleKey) -> std::cmp::Ordering {
+    (a.ip, a.port, a.proto, a.direction).cmp(&(b.ip, b.port, b.proto, b.direction))
+}
+
+/// Apply `desired` to `rules_map` given the current `existing` snapshot.
+/// Removes only keys that aren't in the new set first (freeing capacity
+/// while keeping `existing ∩ desired` continuously allowed), then upserts
+/// any new keys. This avoids the "clear, then partially insert" window
+/// where the host is ISOLATED with a partial allowlist.
+///
+/// FwRuleKey doesn't derive Hash so membership is a linear scan; the cap
+/// is 64 and rule sets are small, so O(n²) is negligible.
+fn apply_ruleset(
+    rules_map: &mut AyaHashMap<MapData, FwRuleKey, u8>,
+    existing: &[FwRuleKey],
+    desired: &[FwRuleKey],
+) -> std::result::Result<(), String> {
+    for key in existing {
+        if !desired.contains(key) {
+            let _ = rules_map.remove(key);
+        }
+    }
+    for key in desired {
+        if !existing.contains(key) {
+            rules_map
+                .insert(key, &1u8, 0)
+                .map_err(|e| format!("{e}"))?;
+        }
+    }
+    Ok(())
 }
 
 fn attach_tc_via_ebpf(ebpf: &mut Ebpf, iface: &str, attached: &AttachedIfaces) {
@@ -340,10 +419,28 @@ const RTM_DELLINK: u16 = 17;
 const NLMSG_HDR_LEN: usize = 16; // sizeof(struct nlmsghdr)
 const IFINFOMSG_LEN: usize = 16; // sizeof(struct ifinfomsg)
 
+/// `poll()` timeout for each iteration of the netlink watcher. Bounds the
+/// time we leak a `spawn_blocking` worker on shutdown to roughly this
+/// value, since dropping the JoinHandle does not cancel a blocking task.
+const IFACE_WATCHER_POLL_MS: i32 = 500;
+
 #[derive(Debug)]
 enum NetlinkIfaceEvent {
     New(String),
     Del(String),
+}
+
+/// Outcome of a single watcher poll/recv iteration.
+enum RecvOutcome {
+    /// One link event was decoded.
+    Event(NetlinkIfaceEvent),
+    /// A message arrived but it wasn't RTM_NEWLINK / RTM_DELLINK, or the
+    /// payload couldn't be decoded.
+    NotInteresting,
+    /// `poll()` timed out — no data was available.
+    Timeout,
+    /// Lower-level error (poll/recv failed). Caller should keep looping.
+    Error,
 }
 
 fn open_rtmgrp_link_socket() -> std::result::Result<std::net::UdpSocket, String> {
@@ -379,28 +476,47 @@ fn open_rtmgrp_link_socket() -> std::result::Result<std::net::UdpSocket, String>
     Ok(unsafe { std::net::UdpSocket::from_raw_fd(fd) })
 }
 
-/// Blocking call: read one netlink message and return a `NetlinkIfaceEvent`
-/// if the message type is `RTM_NEWLINK` or `RTM_DELLINK`.
-fn recv_rtm_link_event(fd: std::os::unix::io::RawFd) -> Option<NetlinkIfaceEvent> {
+/// Poll the netlink fd for up to `timeout_ms` milliseconds and, if data is
+/// ready, read one message and return a `NetlinkIfaceEvent` if it's
+/// `RTM_NEWLINK` / `RTM_DELLINK`. Always returns within `timeout_ms` plus
+/// the time of one nonblocking recv, so a dropped `spawn_blocking`
+/// JoinHandle leaks at most that much wall time.
+fn recv_rtm_link_event(fd: std::os::unix::io::RawFd, timeout_ms: i32) -> RecvOutcome {
+    let mut pfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // Safety: pfd is valid; libc::poll signature.
+    let pn = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+    if pn == 0 {
+        return RecvOutcome::Timeout;
+    }
+    if pn < 0 {
+        return RecvOutcome::Error;
+    }
+
     let mut buf = [0u8; 4096];
+    // Use MSG_DONTWAIT so we never block here even if poll lied about
+    // readiness (e.g. spurious wakeup); poll already ensured POLLIN.
     // Safety: buf is valid writable memory; fd is a valid socket fd.
     let n = unsafe {
         libc::recv(
             fd,
             buf.as_mut_ptr() as *mut libc::c_void,
             buf.len(),
-            0,
+            libc::MSG_DONTWAIT,
         )
     };
     if n < NLMSG_HDR_LEN as isize {
-        return None;
+        return RecvOutcome::NotInteresting;
     }
     let n = n as usize;
 
     // nlmsghdr layout: [u32 len][u16 type][u16 flags][u32 seq][u32 pid]
     let msg_type = u16::from_ne_bytes([buf[4], buf[5]]);
     if msg_type != RTM_NEWLINK && msg_type != RTM_DELLINK {
-        return None;
+        return RecvOutcome::NotInteresting;
     }
 
     // After nlmsghdr (16 B) comes ifinfomsg (16 B), then rtattrs.
@@ -415,18 +531,18 @@ fn recv_rtm_link_event(fd: std::os::unix::io::RawFd) -> Option<NetlinkIfaceEvent
         // IFLA_IFNAME = 3
         if rta_type == 3 {
             let data = &buf[offset + 4..offset + rta_len];
-            let name = std::str::from_utf8(data)
-                .ok()?
-                .trim_end_matches('\0')
-                .to_string();
+            let name = match std::str::from_utf8(data) {
+                Ok(s) => s.trim_end_matches('\0').to_string(),
+                Err(_) => return RecvOutcome::NotInteresting,
+            };
             return if msg_type == RTM_NEWLINK {
-                Some(NetlinkIfaceEvent::New(name))
+                RecvOutcome::Event(NetlinkIfaceEvent::New(name))
             } else {
-                Some(NetlinkIfaceEvent::Del(name))
+                RecvOutcome::Event(NetlinkIfaceEvent::Del(name))
             };
         }
         let aligned = (rta_len + 3) & !3;
         offset += aligned.max(4);
     }
-    None
+    RecvOutcome::NotInteresting
 }

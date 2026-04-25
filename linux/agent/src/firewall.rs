@@ -63,6 +63,11 @@ pub const SE_FW_DIR_IN: u8 = 1;
 pub const SE_FW_DIR_OUT: u8 = 2;
 pub const SE_FW_DIR_ANY: u8 = 0;
 
+/// Maximum rules the kmod can hold per its `SE_FW_MAX_RULES` constant in
+/// `agent/linux/kmod/firewall.h`. Used to pre-validate rule count before
+/// mutating kmod state.
+pub const SE_FW_MAX_RULES: usize = 64;
+
 // ioctl numbers (matching Linux _IOW/_IOR/_IO macros):
 //   dir:  write=1, read=2
 //   bits: [31:30]=dir [29:16]=size [15:8]=type [7:0]=nr
@@ -122,16 +127,17 @@ impl KmodFirewall {
 
     /// Build an outbound whitelist rule for a given IP address.
     ///
-    /// The kmod expects `ip` in **network byte order** (the same layout as
-    /// `iph->saddr`/`iph->daddr` on the wire). `Ipv4Addr::octets()` already
-    /// returns bytes in most-significant-first order, so `from_be_bytes`
-    /// produces the correct NBO `u32` regardless of host endianness. Using
-    /// `from_ne_bytes` on little-endian hosts silently byte-swapped the IP
-    /// and broke rule matching.
+    /// The kmod/eBPF datapath compares against the IP header's `__be32`
+    /// fields loaded as a raw host `u32` — i.e. the integer whose
+    /// in-memory byte layout matches the wire (network byte order). On a
+    /// little-endian host that is `from_ne_bytes(octets)`; `from_be_bytes`
+    /// would byte-swap and produce a value that never matches real
+    /// packets. `Ipv4Addr::octets()` already returns bytes in most-
+    /// significant-first (network) order, so this preserves them as-is.
     pub fn rule_allow_ip_out(ip: IpAddr) -> Option<SeFwRule> {
         match ip {
             IpAddr::V4(v4) => {
-                let ip_be = u32::from_be_bytes(v4.octets());
+                let ip_be = u32::from_ne_bytes(v4.octets());
                 Some(SeFwRule {
                     ip: ip_be,
                     port: 0,
@@ -148,7 +154,7 @@ impl KmodFirewall {
     pub fn rule_allow_ip_in(ip: IpAddr) -> Option<SeFwRule> {
         match ip {
             IpAddr::V4(v4) => {
-                let ip_be = u32::from_be_bytes(v4.octets());
+                let ip_be = u32::from_ne_bytes(v4.octets());
                 Some(SeFwRule {
                     ip: ip_be,
                     port: 0,
@@ -166,24 +172,47 @@ impl NetworkFirewall for KmodFirewall {
         let guard = self.handle.raw_fd()?;
         let raw = guard.as_raw_fd();
 
-        // Safety: raw fd is valid; ioctl syscall with correct nr and no data pointer.
-        unsafe { se_fw_clear_rules(raw) }.map_err(|e| ioctl_err("clear_rules", e))?;
-
         let default_rules: &[SeFwRule] = &[
             SeFwRule { ip: 0, port: 53, proto: SE_FW_PROTO_UDP, direction: SE_FW_DIR_OUT },
             SeFwRule { ip: 0, port: 53, proto: SE_FW_PROTO_UDP, direction: SE_FW_DIR_IN },
         ];
 
+        // Pre-validate rule count before mutating kmod state. The kmod's
+        // `add_rule` ioctl rejects inserts past SE_FW_MAX_RULES; previously
+        // we would clear all rules first and then fail mid-insert, leaving
+        // the host with a partial allowlist while still in ISOLATED mode.
+        let total = default_rules.len() + extra_rules.len();
+        if total > SE_FW_MAX_RULES {
+            return Err(AgentError::Platform(format!(
+                "kmod: refusing to isolate — rule count {} exceeds cap {}",
+                total, SE_FW_MAX_RULES
+            )));
+        }
+
+        // Safety: raw fd is valid; ioctl syscall with correct nr and no data pointer.
+        unsafe { se_fw_clear_rules(raw) }.map_err(|e| ioctl_err("clear_rules", e))?;
+
         for rule in default_rules.iter().chain(extra_rules.iter()) {
             // Safety: raw fd is valid; rule is a properly sized repr(C) struct.
-            unsafe { se_fw_add_rule(raw, rule) }.map_err(|e| ioctl_err("add_rule", e))?;
+            if let Err(e) = unsafe { se_fw_add_rule(raw, rule) } {
+                // Roll back: the kmod has no enumerate ioctl, so we can't
+                // restore the previous ruleset. Leaving a partial allowlist
+                // active in ISOLATED mode would silently lock the agent
+                // out of its backend; safer to fail open by clearing rules
+                // and dropping back to NORMAL than to ship a half-applied
+                // policy.
+                let _ = unsafe { se_fw_clear_rules(raw) };
+                let normal = SeFwMode { mode: SE_FW_MODE_NORMAL, _pad: [0; 7] };
+                let _ = unsafe { se_fw_set_mode(raw, &normal) };
+                return Err(ioctl_err("add_rule (rolled back to NORMAL)", e));
+            }
         }
 
         let mode = SeFwMode { mode: SE_FW_MODE_ISOLATED, _pad: [0; 7] };
         // Safety: raw fd is valid; mode is a properly sized repr(C) struct.
         unsafe { se_fw_set_mode(raw, &mode) }.map_err(|e| ioctl_err("set_mode", e))?;
 
-        info!("firewall(kmod): host isolated ({} rules)", default_rules.len() + extra_rules.len());
+        info!("firewall(kmod): host isolated ({} rules)", total);
         Ok(())
     }
 

@@ -216,26 +216,35 @@ impl AgentUpdater for LinuxAgentUpdater {
             let kmod_filename = kmod_update_filename(&target_version);
             let kmod_file = Path::new(UPDATES_DIR).join(&kmod_filename);
 
-            // Fetch kmod SHA256 (reuses same gRPC call, platform key differs)
+            // Fetch kmod SHA256. The kmod loads into the kernel, so it has
+            // strictly stronger trust requirements than the userspace agent.
+            // Treat any inability to obtain a hash as fatal; refuse to even
+            // download an unsigned/unverifiable kmod package.
             let kmod_sha256 = match ctrl.get_target_version(&agent_id, kmod_plat).await {
-                Ok((_, sha)) => sha,
+                Ok((_, sha)) if !sha.is_empty() => sha,
+                Ok(_) => {
+                    error!(component = "agent-update", "kmod sha256 missing from control plane — aborting update");
+                    return Err(AgentError::Platform(
+                        "kmod update aborted: empty kmod sha256 (unauthenticated update)".to_string(),
+                    ));
+                }
                 Err(e) => {
-                    warn!(component = "agent-update", error = %e, "failed to fetch kmod sha256, skipping kmod update");
-                    String::new()
+                    error!(component = "agent-update", error = %e, "failed to fetch kmod sha256 — aborting update");
+                    return Err(AgentError::Platform(format!(
+                        "kmod update aborted: cannot fetch kmod sha256: {}",
+                        e
+                    )));
                 }
             };
 
             info!(component = "agent-update", path = %kmod_file.display(), "downloading kmod update");
             match ctrl.download_agent_update(&agent_id, kmod_plat, &target_version, &kmod_file).await {
                 Ok(()) => {
-                    // Verify kmod SHA256 if provided; mismatch aborts the entire update
-                    if !kmod_sha256.is_empty() {
-                        if let Err(e) = verify_sha256(&kmod_file, &kmod_sha256) {
-                            error!(component = "agent-update", path = %kmod_file.display(), error = %e, "kmod sha256 mismatch — aborting update");
-                            return Err(AgentError::Platform(format!("kmod update aborted: {}", e)));
-                        }
-                        info!(component = "agent-update", "kmod package sha256 verified");
+                    if let Err(e) = verify_sha256(&kmod_file, &kmod_sha256) {
+                        error!(component = "agent-update", path = %kmod_file.display(), error = %e, "kmod sha256 mismatch — aborting update");
+                        return Err(AgentError::Platform(format!("kmod update aborted: {}", e)));
                     }
+                    info!(component = "agent-update", "kmod package sha256 verified");
                     Some(kmod_file)
                 }
                 Err(e) => {

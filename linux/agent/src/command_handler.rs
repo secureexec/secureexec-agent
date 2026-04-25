@@ -128,10 +128,13 @@ impl LinuxCommandHandler {
             0u32
         } else {
             Ipv4Addr::from_str(ip)
-                // kmod stores IPs in network byte order; Ipv4Addr::octets()
-                // already returns bytes big-endian, so from_be_bytes yields
-                // the correct NBO `u32` on any host endianness.
-                .map(|a| u32::from_be_bytes(a.octets()))
+                // kmod/eBPF compare against `__be32` (kernel) / raw `u32`
+                // loaded straight from the IP header — i.e. the in-memory
+                // byte layout is network byte order. We need the rule `u32`
+                // to have the same in-memory layout, which on a little-
+                // endian host is `from_ne_bytes` (`from_be_bytes` would
+                // byte-swap, leaving rules that never match real packets).
+                .map(|a| u32::from_ne_bytes(a.octets()))
                 .unwrap_or_else(|_| {
                     warn!(ip = %ip, "invalid IP in isolation rule, treating as any");
                     0u32

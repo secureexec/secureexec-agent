@@ -213,14 +213,21 @@ fn try_sched_process_exit(_ctx: &TracePointContext) -> Result<(), i64> {
     let pid_tgid = bpf_get_current_pid_tgid();
     let pid = pid_tgid as u32;
     let tgid = (pid_tgid >> 32) as u32;
+
+    // sched_process_exit fires on every task (thread) exit, but a process
+    // is only "exited" when its group leader (pid == tgid) leaves. Emitting
+    // an event for non-leader thread exits would let userspace evict live
+    // processes from its cache and ship spurious ProcessExit telemetry.
+    if pid != tgid {
+        return Ok(());
+    }
+
     let comm = bpf_get_current_comm().unwrap_or([0u8; TASK_COMM_LEN]);
 
-    let exit_code: i32 = if pid == tgid {
+    let exit_code: i32 = {
         let code = unsafe { PENDING_EXIT.get(&tgid).copied().unwrap_or(0) };
         let _ = PENDING_EXIT.remove(&tgid);
         code
-    } else {
-        0
     };
 
     if let Some(mut buf) = PROCESS_EVENTS.reserve::<ProcessExitEvent>(0) {

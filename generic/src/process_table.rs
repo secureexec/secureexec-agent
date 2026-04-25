@@ -177,9 +177,25 @@ impl ProcessTable {
                 self.add_pid_index(pe.pid, st);
             }
             EventKind::ProcessExit(pe) => {
-                let key = (pe.pid, truncate_to_millis(pe.start_time));
-                if let Some(entry) = self.processes.get_mut(&key) {
+                // Try the exact (pid, start_time) key first.  If it misses
+                // (e.g. eBPF cache miss for a snapshot process means the
+                // exit ships with `Utc::now()` instead of the real procfs
+                // btime), fall back to the most recent entry for this pid
+                // via the by_pid index — same fallback `lookup()` uses on
+                // the read path.  Without this, snapshot processes never
+                // get marked exited and stay "alive" in the table forever.
+                let st = truncate_to_millis(pe.start_time);
+                let exact_key = (pe.pid, st);
+                if let Some(entry) = self.processes.get_mut(&exact_key) {
                     entry.exit_time = Some(event.timestamp);
+                } else if let Some(fallback_st) = self
+                    .by_pid
+                    .get(&pe.pid)
+                    .and_then(|sts| sts.iter().max().copied())
+                {
+                    if let Some(entry) = self.processes.get_mut(&(pe.pid, fallback_st)) {
+                        entry.exit_time = Some(event.timestamp);
+                    }
                 }
             }
             _ => {}
