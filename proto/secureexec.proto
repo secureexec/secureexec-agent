@@ -205,6 +205,7 @@ message AgentHeartbeatEvent {
   uint64 ebpf_drops_file     = 12; // cumulative ring-buffer drops: FILE_EVENTS
   uint64 ebpf_drops_network  = 13; // cumulative ring-buffer drops: NETWORK_EVENTS
   uint64 ebpf_drops_security = 14; // cumulative ring-buffer drops: SECURITY_EVENTS
+  uint64 ebpf_offset_mismatches = 15; // total BPF offset mismatches (tracepoint format + kernel struct via BTF)
 }
 
 enum Severity {

@@ -93,6 +93,13 @@ pub struct AgentHeartbeatEvent {
     pub ebpf_drops_network: u64,
     #[serde(default)]
     pub ebpf_drops_security: u64,
+    /// Total BPF ABI sanity-check failures detected at startup: tracepoint
+    /// offset mismatches, missing tracepoints, unavailable tracefs, kernel
+    /// struct field mismatches, missing structs, or unavailable BTF.
+    /// Non-zero means BPF programs may be reading garbage; triggers a
+    /// CRITICAL server alert.
+    #[serde(default)]
+    pub ebpf_offset_mismatches: u64,
 }
 
 impl ContentHash for AgentHeartbeatEvent {
@@ -108,6 +115,7 @@ impl ContentHash for AgentHeartbeatEvent {
         h.update(self.ebpf_drops_file.to_le_bytes());
         h.update(self.ebpf_drops_network.to_le_bytes());
         h.update(self.ebpf_drops_security.to_le_bytes());
+        h.update(self.ebpf_offset_mismatches.to_le_bytes());
     }
 }
 

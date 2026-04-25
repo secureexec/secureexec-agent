@@ -27,6 +27,11 @@ static PROC_DROP_COUNT: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
 #[map]
 static PENDING_EXIT: HashMap<u32, i32> = HashMap::with_max_entries(4096, 0);
 
+/// `CLONE_THREAD` from `<linux/sched.h>` — set by every thread library
+/// (pthread_create, std::thread, golang's runtime, etc.) to make the new
+/// task share the parent's thread group.
+const CLONE_THREAD: u64 = 0x0001_0000;
+
 #[inline(always)]
 fn bump_proc_drop() {
     // Safety: index 0 is always valid (max_entries=1); per-CPU so no races.
@@ -259,44 +264,61 @@ pub fn sys_enter_exit_group(ctx: TracePointContext) -> u32 {
 }
 
 // ---------------------------------------------------------------------------
-// sched_process_fork
+// task_newtask — emit new-process events (threads filtered by CLONE_THREAD)
+//
+// task/task_newtask fires inside copy_process() for every clone/fork/vfork,
+// and exposes clone_flags natively — no side-channel map needed.  Format:
+//   pid@8 (pid_t, 4 bytes), comm@12 (char[16]), clone_flags@32 (u64).
+// Offsets validated at agent startup by TracefsValidator in userspace.
+//
+// current = the parent task executing the clone syscall, so
+// bpf_get_current_pid_tgid() >> 32 gives the parent's TGID directly —
+// always the thread-group leader, even when cloned from a worker thread.
 // ---------------------------------------------------------------------------
 
-#[tracepoint(category = "sched", name = "sched_process_fork")]
-pub fn sched_process_fork(ctx: TracePointContext) -> u32 {
-    match try_sched_process_fork(&ctx) {
+#[tracepoint(category = "task", name = "task_newtask")]
+pub fn task_newtask(ctx: TracePointContext) -> u32 {
+    match try_task_newtask(&ctx) {
         Ok(()) => 0,
         Err(_) => 0,
     }
 }
 
-fn try_sched_process_fork(ctx: &TracePointContext) -> Result<(), i64> {
-    let parent_pid: u32 = unsafe { ctx.read_at(24).unwrap_or(0) };
-    let child_pid: u32  = unsafe { ctx.read_at(44).unwrap_or(0) };
+fn try_task_newtask(ctx: &TracePointContext) -> Result<(), i64> {
+    let clone_flags: u64 = unsafe { ctx.read_at(32).unwrap_or(0) };
 
+    // CLONE_THREAD ⇒ new thread in an existing thread group, not a new
+    // process.  Drop at the kernel layer so the ring buffer never sees it.
+    if clone_flags & CLONE_THREAD != 0 {
+        return Ok(());
+    }
+
+    // child pid == child tgid for non-CLONE_THREAD tasks (new thread-group
+    // leader).  pid@8 in the tracepoint format.
+    let child_pid: u32 = unsafe { ctx.read_at(8).unwrap_or(0) };
+    let parent_tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
+    let uid = bpf_get_current_uid_gid() as u32;
+
+    // comm@12 (char[16]) — the new task's name, copied by the kernel before
+    // this tracepoint fires.
     let mut comm = [0u8; TASK_COMM_LEN];
     unsafe {
+        // Safety: ctx.as_ptr() points to the tracepoint common header;
+        // comm is at a fixed offset of 12 bytes, fully within the struct.
         let _ = bpf_probe_read_kernel_buf(
-            (ctx.as_ptr() as usize + 8) as *const u8,
+            (ctx.as_ptr() as usize + 12) as *const u8,
             &mut comm,
         );
     }
 
-    let pid_tgid = bpf_get_current_pid_tgid();
-    let parent_tgid = (pid_tgid >> 32) as u32;
-    let uid = bpf_get_current_uid_gid() as u32;
-
     if let Some(mut buf) = PROCESS_EVENTS.reserve::<ProcessForkEvent>(0) {
         let event = unsafe { &mut *buf.as_mut_ptr() };
-        event.event_tag = PROC_EVT_FORK;
-        event._pad = [0; 3];
-        event.parent_pid = parent_pid;
-        event.parent_tgid = parent_tgid;
-        event.child_pid = child_pid;
-        event.child_tgid = child_pid;
-        event.uid = uid;
-        event._pad2 = 0;
-        event.comm = comm;
+        event.event_tag  = PROC_EVT_FORK;
+        event._pad       = [0; 3];
+        event.parent_pid = parent_tgid;
+        event.child_pid  = child_pid;
+        event.uid        = uid;
+        event.comm       = comm;
         buf.submit(0);
     } else {
         bump_proc_drop();

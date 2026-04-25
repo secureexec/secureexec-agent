@@ -10,8 +10,54 @@ use nix::sys::epoll::{Epoll, EpollCreateFlags, EpollEvent, EpollFlags};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info};
 
+use super::btf_offsets::{BtfStructValidator, VALIDATED_KERNEL_FIELDS};
 use super::parsers::{parse_file_event, parse_network_event, parse_process_event, parse_security_event};
+use super::tracefs::{TracefsValidator, VALIDATED_TRACEPOINTS};
 use super::types::{BpfEvent, EbpfDropCounters};
+
+// ---------------------------------------------------------------------------
+// BPF ABI offset validator
+// ---------------------------------------------------------------------------
+
+/// Validate all hard-coded tracepoint and kernel-struct offsets against the
+/// running kernel.  Must be called once at agent startup before polling begins.
+///
+/// Any anomaly (offset mismatch, missing tracepoint, unavailable tracefs or
+/// BTF) is logged at `error!` level so that the `LogSpoolLayer` ships it to
+/// the server automatically.  The total count of anomalies is stored in
+/// `counters.ebpf_offset_mismatches` for the heartbeat.
+pub(super) fn validate_bpf_abi(counters: &EbpfDropCounters) {
+    let mut all_mismatches = Vec::new();
+    all_mismatches.extend(TracefsValidator::new().validate_all(VALIDATED_TRACEPOINTS));
+    all_mismatches.extend(BtfStructValidator::new().validate_all(VALIDATED_KERNEL_FIELDS));
+
+    if all_mismatches.is_empty() {
+        tracing::info!(
+            component = "ebpf_offsets",
+            validated_tracepoints   = VALIDATED_TRACEPOINTS.len(),
+            validated_struct_fields = VALIDATED_KERNEL_FIELDS.len(),
+            "linux-ebpf: BPF ABI sanity check passed"
+        );
+    } else {
+        for m in &all_mismatches {
+            tracing::error!(
+                component       = "ebpf_offsets",
+                kind            = ?m.kind,
+                reason          = m.reason,
+                label           = %m.label,
+                field           = %m.field,
+                expected_offset = ?m.expected_offset,
+                actual_offset   = ?m.actual_offset,
+                expected_size   = ?m.expected_size,
+                actual_size     = ?m.actual_size,
+                "linux-ebpf: BPF ABI sanity check failure (kernel/agent ABI drift)"
+            );
+        }
+    }
+
+    counters.ebpf_offset_mismatches
+        .store(all_mismatches.len() as u64, Ordering::Relaxed);
+}
 
 // ---------------------------------------------------------------------------
 // eBPF loader
@@ -39,7 +85,9 @@ pub fn load_ebpf() -> std::result::Result<Ebpf, String> {
     // -- process --
     attach_tracepoint(&mut ebpf, "sched_process_exec", "sched", "sched_process_exec")?;
     attach_tracepoint(&mut ebpf, "sched_process_exit", "sched", "sched_process_exit")?;
-    attach_tracepoint(&mut ebpf, "sched_process_fork", "sched", "sched_process_fork")?;
+    // task_newtask exposes clone_flags natively, so we filter CLONE_THREAD
+    // at the kernel layer without any side-channel map.
+    attach_tracepoint(&mut ebpf, "task_newtask",     "task",     "task_newtask")?;
     attach_tracepoint(&mut ebpf, "sys_enter_exit_group", "syscalls", "sys_enter_exit_group")?;
     attach_tracepoint(&mut ebpf, "sys_enter_execve", "syscalls", "sys_enter_execve")?;
     // -- file --

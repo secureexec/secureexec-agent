@@ -15,7 +15,7 @@ use secureexec_generic::sensor::Sensor;
 
 use super::super::{exe_hash, procfs, snapshot};
 use super::convert::convert_bpf_events;
-use super::loader::{load_ebpf, poll_ebpf, poll_ebpf_from_arc};
+use super::loader::{load_ebpf, poll_ebpf, poll_ebpf_from_arc, validate_bpf_abi};
 use super::types::{BpfEvent, EbpfDropCounters};
 
 pub struct LinuxEbpfSensor {
@@ -89,6 +89,9 @@ impl Sensor for LinuxEbpfSensor {
         let bpf_thread = std::thread::Builder::new()
             .name("ebpf-poller".into())
             .spawn(move || {
+                // Validate all hard-coded BPF offsets before loading/polling.
+                validate_bpf_abi(&dc);
+
                 let ebpf = if let Some(arc) = shared_ebpf {
                     // Shared path: take the Ebpf out of the Arc<Mutex>.
                     // The firewall has already taken FW_MODE/FW_RULES maps and

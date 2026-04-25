@@ -543,6 +543,7 @@ fn event_to_proto(event: &Event) -> pb::AgentEvent {
             ebpf_drops_file: e.ebpf_drops_file,
             ebpf_drops_network: e.ebpf_drops_network,
             ebpf_drops_security: e.ebpf_drops_security,
+            ebpf_offset_mismatches: e.ebpf_offset_mismatches,
         })),
         EventKind::Detection(e) => Some(pb::agent_event::Kind::Detection(pb::DetectionEvent {
             rule_name: e.rule_name.clone(),

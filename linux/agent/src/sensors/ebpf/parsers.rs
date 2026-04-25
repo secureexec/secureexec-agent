@@ -79,7 +79,7 @@ pub(super) fn parse_process_event(data: &[u8]) -> Option<BpfEvent> {
             // Safety: bounds-checked above; ProcessForkEvent is repr(C).
             let e = unsafe { &*(data.as_ptr() as *const ProcessForkEvent) };
             Some(BpfEvent::ProcessFork {
-                parent_pid: e.parent_tgid,
+                parent_pid: e.parent_pid,
                 child_pid: e.child_pid,
                 uid: e.uid,
                 comm: bytes_to_string(&e.comm),

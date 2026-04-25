@@ -396,6 +396,9 @@ async fn heartbeat_loop(
                 let drops = command_handler.as_ref()
                     .map(|h| h.ebpf_drop_counts())
                     .unwrap_or([0; 4]);
+                let ebpf_offset_mismatches = command_handler.as_ref()
+                    .map(|h| h.ebpf_offset_mismatches())
+                    .unwrap_or(0);
                 let event = make_event(&agent_id, &hostname, &os, EventKind::AgentHeartbeat(AgentHeartbeatEvent {
                     uptime_secs: started_at.elapsed().as_secs(),
                     spool_pending,
@@ -411,6 +414,7 @@ async fn heartbeat_loop(
                     ebpf_drops_file: drops[1],
                     ebpf_drops_network: drops[2],
                     ebpf_drops_security: drops[3],
+                    ebpf_offset_mismatches,
                 }));
                 if tx.send(event).await.is_err() {
                     return;

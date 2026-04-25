@@ -9,6 +9,10 @@ pub struct EbpfDropCounters {
     pub security: AtomicU64,
     /// Events dropped because the userspace mpsc channel was full.
     pub channel_full: AtomicU64,
+    /// Count of BPF ABI sanity check failures detected at startup:
+    /// tracepoint offset mismatches, missing tracepoints, unavailable tracefs,
+    /// kernel struct field mismatches, missing structs, or unavailable BTF.
+    pub ebpf_offset_mismatches: AtomicU64,
 }
 
 impl EbpfDropCounters {
@@ -19,6 +23,7 @@ impl EbpfDropCounters {
             network: AtomicU64::new(0),
             security: AtomicU64::new(0),
             channel_full: AtomicU64::new(0),
+            ebpf_offset_mismatches: AtomicU64::new(0),
         }
     }
 

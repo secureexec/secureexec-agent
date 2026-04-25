@@ -364,4 +364,10 @@ impl CommandHandler for LinuxCommandHandler {
     fn ebpf_drop_counts(&self) -> [u64; 4] {
         self.drop_counters.as_ref().map(|dc| dc.snapshot()).unwrap_or([0; 4])
     }
+
+    fn ebpf_offset_mismatches(&self) -> u64 {
+        self.drop_counters.as_ref()
+            .map(|dc| dc.ebpf_offset_mismatches.load(std::sync::atomic::Ordering::Relaxed))
+            .unwrap_or(0)
+    }
 }

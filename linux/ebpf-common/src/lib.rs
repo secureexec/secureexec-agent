@@ -13,7 +13,7 @@ pub const MAX_DNS_PAYLOAD: usize = 256;
 // PROCESS_EVENTS buffer tags
 pub const PROC_EVT_EXEC: u8 = 0; // sched_process_exec
 pub const PROC_EVT_EXIT: u8 = 1; // sched_process_exit
-pub const PROC_EVT_FORK: u8 = 2; // sched_process_fork
+pub const PROC_EVT_FORK: u8 = 2; // task:task_newtask (threads filtered by CLONE_THREAD)
 pub const PROC_EVT_ARGV: u8 = 3; // sys_enter_execve (full argv + LD_PRELOAD)
 
 // FILE_EVENTS buffer tags
@@ -130,12 +130,15 @@ pub struct ProcessExitEvent {
 pub struct ProcessForkEvent {
     pub event_tag: u8,        // PROC_EVT_FORK
     pub _pad: [u8; 3],
+    /// Parent's TGID (always == parent_tgid of the cloning task; when the
+    /// cloning task is a non-leader thread, this is still the thread-group
+    /// leader, which is the only useful "parent process" identity).
     pub parent_pid: u32,
-    pub parent_tgid: u32,
+    /// Child's TGID. Threads (CLONE_THREAD) are filtered out in the
+    /// fork handler, so this is always == the new task's TGID, which equals
+    /// the new task's PID for the thread-group leader.
     pub child_pid: u32,
-    pub child_tgid: u32,
     pub uid: u32,
-    pub _pad2: u32,
     pub comm: [u8; TASK_COMM_LEN],
 }
 

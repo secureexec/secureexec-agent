@@ -53,6 +53,13 @@ pub trait CommandHandler: Send + Sync + 'static {
     fn ebpf_drop_counts(&self) -> [u64; 4] {
         [0; 4]
     }
+
+    /// Total BPF ABI sanity-check failures detected at startup.
+    /// Non-zero means the running kernel's tracepoint offsets or struct layouts
+    /// differ from the values hard-coded in the eBPF programs.
+    fn ebpf_offset_mismatches(&self) -> u64 {
+        0
+    }
 }
 
 /// A no-op command handler for platforms that don't support kmod commands.
