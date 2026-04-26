@@ -40,10 +40,17 @@ pub struct OffsetMismatch {
 // ---------------------------------------------------------------------------
 
 /// Expected offset+size for one field within a tracepoint's raw buffer.
+///
+/// `field` is the canonical / preferred kernel-format name; `aliases`
+/// holds historical names accepted as equivalent (some syscall arg names
+/// have been renamed across kernel versions — e.g. `setns` arg 1 was
+/// `nstype` in <5.8 and `flags` in >=5.8; both refer to the same slot).
+/// The validator looks up `field` first, then each entry in `aliases`.
 pub struct ExpectedField {
-    pub field:  &'static str,
-    pub offset: usize,
-    pub size:   usize,
+    pub field:   &'static str,
+    pub aliases: &'static [&'static str],
+    pub offset:  usize,
+    pub size:    usize,
 }
 
 impl ExpectedField {
@@ -54,14 +61,24 @@ impl ExpectedField {
     /// the slot starts at offset `16 + 8*idx` after the 16-byte common
     /// header + `__syscall_nr` slot.
     pub const fn syscall_arg(field: &'static str, idx: usize) -> Self {
-        Self { field, offset: 16 + 8 * idx, size: 8 }
+        Self { field, aliases: &[], offset: 16 + 8 * idx, size: 8 }
+    }
+
+    /// Same as `syscall_arg` but accepts alternative kernel-format names
+    /// for fields that have been renamed across kernel versions.
+    pub const fn syscall_arg_aliased(
+        field:   &'static str,
+        aliases: &'static [&'static str],
+        idx:     usize,
+    ) -> Self {
+        Self { field, aliases, offset: 16 + 8 * idx, size: 8 }
     }
 
     /// Field spec for a `__data_loc` field that immediately follows the
     /// 8-byte common tracepoint header (`__field`-less tracepoints whose
     /// first declared entry is `__string`/`__data_loc`).
     pub const fn data_loc(field: &'static str) -> Self {
-        Self { field, offset: 8, size: 4 }
+        Self { field, aliases: &[], offset: 8, size: 4 }
     }
 }
 
@@ -143,7 +160,12 @@ impl TracefsValidator {
                 }
                 Ok(actual_fields) => {
                     for ef in spec.fields {
-                        match actual_fields.get(ef.field) {
+                        // Look up the canonical name first; on miss, walk the
+                        // alias list (used for kernel-version field renames).
+                        let lookup = actual_fields.get(ef.field).or_else(|| {
+                            ef.aliases.iter().find_map(|a| actual_fields.get(*a))
+                        });
+                        match lookup {
                             None => {
                                 out.push(OffsetMismatch {
                                     kind:            MismatchKind::Tracepoint,
@@ -302,9 +324,9 @@ pub const VALIDATED_TRACEPOINTS: &[TracepointSpec] = &[
         category: "task",
         name:     "task_newtask",
         fields:   &[
-            ExpectedField { field: "pid",         offset: 8,  size: 4  },
-            ExpectedField { field: "comm",        offset: 12, size: 16 },
-            ExpectedField { field: "clone_flags", offset: 32, size: 8  },
+            ExpectedField { field: "pid",         aliases: &[], offset: 8,  size: 4  },
+            ExpectedField { field: "comm",        aliases: &[], offset: 12, size: 16 },
+            ExpectedField { field: "clone_flags", aliases: &[], offset: 32, size: 8  },
         ],
     },
 
@@ -420,9 +442,12 @@ pub const VALIDATED_TRACEPOINTS: &[TracepointSpec] = &[
     syscall("sys_enter_unshare", &[
         ExpectedField::syscall_arg("unshare_flags", 0),
     ]),
+    // sys_enter_setns — arg 1 was renamed `nstype` → `flags` in 5.8 (kernel
+    // commit 5b30ff3a2f96).  The tracepoint format reports whichever name
+    // applies to the running kernel; we accept both.
     syscall("sys_enter_setns", &[
-        ExpectedField::syscall_arg("fd",     0),
-        ExpectedField::syscall_arg("nstype", 1),
+        ExpectedField::syscall_arg("fd", 0),
+        ExpectedField::syscall_arg_aliased("flags", &["nstype"], 1),
     ]),
     syscall("sys_enter_mount", &[
         ExpectedField::syscall_arg("dev_name", 0),
@@ -445,7 +470,7 @@ pub const VALIDATED_TRACEPOINTS: &[TracepointSpec] = &[
         program:  "module_load",
         category: "module",
         name:     "module_load",
-        fields:   &[ExpectedField { field: "name", offset: 12, size: 4 }],
+        fields:   &[ExpectedField { field: "name", aliases: &[], offset: 12, size: 4 }],
     },
 ];
 
@@ -542,9 +567,9 @@ print fmt: \"filename: 0x%08lx, argv: 0x%08lx, envp: 0x%08lx\", ((unsigned long)
                 category: "task",
                 name:     "task_newtask",
                 fields:   &[
-                    ExpectedField { field: "pid",         offset: 8,  size: 4  },
-                    ExpectedField { field: "comm",        offset: 12, size: 16 },
-                    ExpectedField { field: "clone_flags", offset: 32, size: 8  },
+                    ExpectedField { field: "pid",         aliases: &[], offset: 8,  size: 4  },
+                    ExpectedField { field: "comm",        aliases: &[], offset: 12, size: 16 },
+                    ExpectedField { field: "clone_flags", aliases: &[], offset: 32, size: 8  },
                 ],
             },
         ]);
@@ -565,11 +590,11 @@ print fmt: \"filename: 0x%08lx, argv: 0x%08lx, envp: 0x%08lx\", ((unsigned long)
                 name:     "task_newtask",
                 fields:   &[
                     // wrong offset
-                    ExpectedField { field: "pid",         offset: 0,  size: 4  },
+                    ExpectedField { field: "pid",         aliases: &[], offset: 0,  size: 4  },
                     // wrong size
-                    ExpectedField { field: "clone_flags", offset: 32, size: 4  },
+                    ExpectedField { field: "clone_flags", aliases: &[], offset: 32, size: 4  },
                     // not in tracepoint
-                    ExpectedField { field: "no_such_field", offset: 0, size: 1 },
+                    ExpectedField { field: "no_such_field", aliases: &[], offset: 0, size: 1 },
                 ],
             },
         ]);
@@ -591,7 +616,7 @@ print fmt: \"filename: 0x%08lx, argv: 0x%08lx, envp: 0x%08lx\", ((unsigned long)
                 program:  "task_newtask",
                 category: "task",
                 name:     "task_newtask",
-                fields:   &[ExpectedField { field: "pid", offset: 8, size: 4 }],
+                fields:   &[ExpectedField { field: "pid", aliases: &[], offset: 8, size: 4 }],
             },
         ]);
         assert_eq!(r.len(), 1);
@@ -609,7 +634,7 @@ print fmt: \"filename: 0x%08lx, argv: 0x%08lx, envp: 0x%08lx\", ((unsigned long)
                 program:  "task_newtask",
                 category: "task",
                 name:     "task_newtask",
-                fields:   &[ExpectedField { field: "pid", offset: 8, size: 4 }],
+                fields:   &[ExpectedField { field: "pid", aliases: &[], offset: 8, size: 4 }],
             },
         ]);
         assert_eq!(r.len(), 1);
@@ -640,9 +665,9 @@ print fmt: \"filename: 0x%08lx, argv: 0x%08lx, envp: 0x%08lx\", ((unsigned long)
                 category: "syscalls",
                 name:     "sys_enter_execve",
                 fields:   &[
-                    ExpectedField { field: "filename", offset: 16, size: 8 },
-                    ExpectedField { field: "argv",     offset: 24, size: 8 },
-                    ExpectedField { field: "envp",     offset: 32, size: 8 },
+                    ExpectedField { field: "filename", aliases: &[], offset: 16, size: 8 },
+                    ExpectedField { field: "argv",     aliases: &[], offset: 24, size: 8 },
+                    ExpectedField { field: "envp",     aliases: &[], offset: 32, size: 8 },
                 ],
             },
         ]);
@@ -662,7 +687,7 @@ print fmt: \"filename: 0x%08lx, argv: 0x%08lx, envp: 0x%08lx\", ((unsigned long)
                 program:  "t",
                 category: "task",
                 name:     "t",
-                fields:   &[ExpectedField { field: "comm", offset: 12, size: 16 }],
+                fields:   &[ExpectedField { field: "comm", aliases: &[], offset: 12, size: 16 }],
             },
         ]);
         assert!(r.is_empty(), "{:?}",
@@ -713,7 +738,7 @@ print fmt: \"filename: 0x%08lx, argv: 0x%08lx, envp: 0x%08lx\", ((unsigned long)
                 program:  "module_load",
                 category: "module",
                 name:     "module_load",
-                fields:   &[ExpectedField { field: "name", offset: 8, size: 4 }],
+                fields:   &[ExpectedField { field: "name", aliases: &[], offset: 8, size: 4 }],
             },
         ]);
         assert_eq!(r.len(), 1);
@@ -726,7 +751,7 @@ print fmt: \"filename: 0x%08lx, argv: 0x%08lx, envp: 0x%08lx\", ((unsigned long)
                 program:  "module_load",
                 category: "module",
                 name:     "module_load",
-                fields:   &[ExpectedField { field: "name", offset: 12, size: 4 }],
+                fields:   &[ExpectedField { field: "name", aliases: &[], offset: 12, size: 4 }],
             },
         ]);
         assert!(r.is_empty(), "{:?}",
@@ -804,5 +829,51 @@ print fmt: \"filename: 0x%08lx, argv: 0x%08lx, envp: 0x%08lx\", ((unsigned long)
                 assert!(f.offset >= 8, "{} field {}: offset {} < 8", spec.program, f.field, f.offset);
             }
         }
+    }
+
+    #[test]
+    fn aliased_field_name_falls_through_when_canonical_missing() {
+        // Mirrors the real-world setns rename (`nstype` -> `flags` in 5.8+).
+        // Kernel reports only the legacy name `nstype`; spec asks for the
+        // canonical `flags` with `nstype` as alias.  Lookup must succeed.
+        const FIELDS: &[ExpectedField] = &[
+            ExpectedField::syscall_arg("fd", 0),
+            ExpectedField::syscall_arg_aliased("flags", &["nstype"], 1),
+        ];
+        const SPEC: TracepointSpec = syscall("sys_enter_setns", FIELDS);
+
+        // Format file uses the legacy name `nstype`.
+        let legacy = "name: sys_enter_setns\nID: 1\nformat:\n\
+\tfield:int __syscall_nr;\toffset:8;\tsize:4;\tsigned:1;\n\
+\tfield:int fd;\toffset:16;\tsize:8;\tsigned:0;\n\
+\tfield:int nstype;\toffset:24;\tsize:8;\tsigned:0;\n";
+        let dir = make_tracefs(&[("syscalls", "sys_enter_setns", legacy)]);
+        let v = validator_with_base(dir.path().to_path_buf());
+        let r = v.validate_all(std::slice::from_ref(&SPEC));
+        assert!(r.is_empty(), "legacy name `nstype` should resolve via alias: {:?}",
+                r.iter().map(|m| (&m.field, m.reason)).collect::<Vec<_>>());
+
+        // Modern format file uses the canonical name `flags`.
+        let modern = "name: sys_enter_setns\nID: 1\nformat:\n\
+\tfield:int __syscall_nr;\toffset:8;\tsize:4;\tsigned:1;\n\
+\tfield:int fd;\toffset:16;\tsize:8;\tsigned:0;\n\
+\tfield:int flags;\toffset:24;\tsize:8;\tsigned:0;\n";
+        let dir = make_tracefs(&[("syscalls", "sys_enter_setns", modern)]);
+        let v = validator_with_base(dir.path().to_path_buf());
+        let r = v.validate_all(std::slice::from_ref(&SPEC));
+        assert!(r.is_empty(), "canonical name `flags` should resolve directly: {:?}",
+                r.iter().map(|m| (&m.field, m.reason)).collect::<Vec<_>>());
+
+        // Neither name present — must report the canonical name.
+        let absent = "name: sys_enter_setns\nID: 1\nformat:\n\
+\tfield:int __syscall_nr;\toffset:8;\tsize:4;\tsigned:1;\n\
+\tfield:int fd;\toffset:16;\tsize:8;\tsigned:0;\n\
+\tfield:int other;\toffset:24;\tsize:8;\tsigned:0;\n";
+        let dir = make_tracefs(&[("syscalls", "sys_enter_setns", absent)]);
+        let v = validator_with_base(dir.path().to_path_buf());
+        let r = v.validate_all(std::slice::from_ref(&SPEC));
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].field,  "flags");
+        assert_eq!(r[0].reason, "tracepoint_missing");
     }
 }
