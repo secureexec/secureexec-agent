@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -35,6 +36,17 @@ pub trait Transport: Send + Sync + 'static {
     /// Send agent log entries to the server. Default is no-op (e.g. StdoutTransport).
     async fn send_agent_logs(&self, _agent_id: &str, _entries: &[AgentLogEntry]) -> Result<()> {
         Ok(())
+    }
+
+    /// Monotonically-increasing counter that bumps every time the transport
+    /// establishes a fresh underlying connection to the server. The pipeline
+    /// uses this to detect server restarts and trigger a re-snapshot of the
+    /// in-memory process tree so the server can repopulate its
+    /// `ServerProcessTables`.
+    ///
+    /// Transports without a connection concept (e.g. stdout) return `0`.
+    fn connection_generation(&self) -> u64 {
+        0
     }
 }
 
@@ -89,6 +101,8 @@ pub struct GrpcTransport {
     tls: TlsConfig,
     auth_token: Option<String>,
     client: Mutex<Option<pb::event_ingestion_client::EventIngestionClient<tonic::transport::Channel>>>,
+    /// Bumped after every successful (re)connect.  Read by `connection_generation()`.
+    connection_generation: AtomicU64,
 }
 
 impl GrpcTransport {
@@ -98,6 +112,7 @@ impl GrpcTransport {
             tls,
             auth_token,
             client: Mutex::new(None),
+            connection_generation: AtomicU64::new(0),
         }
     }
 
@@ -149,6 +164,8 @@ impl GrpcTransport {
 
         let client = pb::event_ingestion_client::EventIngestionClient::new(channel);
         *guard = Some(client.clone());
+        let gen = self.connection_generation.fetch_add(1, Ordering::Relaxed) + 1;
+        info!(endpoint = %self.endpoint, generation = gen, "secureexec-server connection established");
         Ok(client)
     }
 
@@ -165,6 +182,10 @@ impl GrpcTransport {
 
 #[async_trait]
 impl Transport for GrpcTransport {
+    fn connection_generation(&self) -> u64 {
+        self.connection_generation.load(Ordering::Relaxed)
+    }
+
     async fn send_batch(&self, events: &[Event]) -> Result<()> {
         let proto_events: Vec<pb::AgentEvent> = events.iter().map(event_to_proto).collect();
         let batch = pb::EventBatch { events: proto_events };

@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -26,6 +26,9 @@ const BLOCKLIST_POLL_INTERVAL_SECS: u64 = 30;
 const PROCESS_EXIT_TTL_SECS: u64 = 120;
 
 const DEDUP_CAPACITY: usize = 65_536;
+
+/// How often the connection-monitor task polls `transport.connection_generation()`.
+const RECONNECT_POLL_INTERVAL_SECS: u64 = 5;
 
 const LOG_SEND_INTERVAL_SECS: u64 = 15;
 const LOG_BATCH_SIZE: usize = 100;
@@ -63,6 +66,12 @@ pub struct Pipeline {
     /// Shared process table — created eagerly so platform command handlers
     /// (e.g. `kill_process_tree`) can receive a handle before `run()` starts.
     process_table: Arc<RwLock<ProcessTable>>,
+    /// Monotonic counter bumped by the pipeline's connection-monitor task
+    /// every time `transport.connection_generation()` increases past `1`,
+    /// signalling to platform sensors that the server has restarted and a
+    /// fresh process snapshot should be re-emitted so the server can rebuild
+    /// its in-memory `ServerProcessTables`.
+    reconnect_generation: Arc<AtomicU64>,
 }
 
 impl Pipeline {
@@ -83,6 +92,7 @@ impl Pipeline {
             blocklist_updater: None,
             log_rx: None,
             process_table,
+            reconnect_generation: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -91,6 +101,15 @@ impl Pipeline {
     /// state when executing commands such as `kill_process_tree`.
     pub fn process_table_handle(&self) -> Arc<RwLock<ProcessTable>> {
         Arc::clone(&self.process_table)
+    }
+
+    /// Return a cloned handle to the reconnect-generation counter.  Platform
+    /// sensors that own snapshot-emitting state (e.g. the Linux `/proc`
+    /// snapshotter) read this counter periodically and re-emit a process
+    /// snapshot when it bumps, which happens whenever the transport
+    /// (re)establishes its underlying connection past the initial one.
+    pub fn reconnect_generation_handle(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.reconnect_generation)
     }
 
     /// Set the receiver for log entries from the tracing layer. When set, logs are
@@ -230,6 +249,19 @@ impl Pipeline {
             None
         };
 
+        // --- Connection monitor task ---
+        // Watches `transport.connection_generation()` and, on every fresh
+        // re-connect after the initial one, bumps `reconnect_generation` so
+        // platform snapshotters can re-flood the server with /proc state.
+        let reconnect_monitor_handle = {
+            let transport = Arc::clone(&self.transport);
+            let reconnect_gen = Arc::clone(&self.reconnect_generation);
+            let cancel_rx = cancel_rx.clone();
+            tokio::spawn(async move {
+                reconnect_monitor_loop(transport, reconnect_gen, cancel_rx).await;
+            })
+        };
+
         drop(event_tx);
 
         let ptable = Arc::clone(&self.process_table);
@@ -298,6 +330,7 @@ impl Pipeline {
         if let Some(h) = command_handle { all_handles.push(h); }
         if let Some(h) = update_handle { all_handles.push(h); }
         if let Some(h) = blocklist_handle { all_handles.push(h); }
+        all_handles.push(reconnect_monitor_handle);
         all_handles.push(drain_handle);
         if let Some(h) = log_spool_handle { all_handles.push(h); }
         if let Some(h) = log_send_handle { all_handles.push(h); }
@@ -691,6 +724,49 @@ async fn blocklist_poll_loop(
                 return;
             }
             _ = tick_work => {}
+        }
+    }
+}
+
+/// Periodically polls `transport.connection_generation()` and bumps the
+/// pipeline-level `reconnect_generation` counter whenever the transport has
+/// re-established a connection past the initial one.
+///
+/// The initial transition (`0 → 1`) is intentionally skipped: at agent start
+/// the platform sensor runs its own first snapshot, so the very first server
+/// connection does not need a re-emit.  Subsequent bumps (`N → N+1`, with
+/// `N >= 1`) indicate either a server restart or a transient network failure;
+/// in both cases the server's in-memory `ServerProcessTables` is empty for
+/// long-lived processes that started before the disruption, and a re-snapshot
+/// from the agent rebuilds it.
+async fn reconnect_monitor_loop(
+    transport: Arc<dyn Transport>,
+    reconnect_gen: Arc<AtomicU64>,
+    mut cancel: watch::Receiver<bool>,
+) {
+    let mut last_seen = transport.connection_generation();
+    let mut ticker = tokio::time::interval(Duration::from_secs(RECONNECT_POLL_INTERVAL_SECS));
+    ticker.tick().await; // skip the immediate first tick
+
+    loop {
+        tokio::select! {
+            _ = cancel.changed() => {
+                debug!("reconnect monitor stopping");
+                return;
+            }
+            _ = ticker.tick() => {
+                let current = transport.connection_generation();
+                if current > last_seen && last_seen > 0 {
+                    let signal = reconnect_gen.fetch_add(1, Ordering::Relaxed) + 1;
+                    info!(
+                        prev = last_seen,
+                        current,
+                        signal,
+                        "transport reconnect detected — signalling /proc re-snapshot",
+                    );
+                }
+                last_seen = current;
+            }
         }
     }
 }

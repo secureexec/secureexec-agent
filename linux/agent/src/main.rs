@@ -54,7 +54,7 @@ async fn main() -> secureexec_generic::error::Result<()> {
     // On success, the Ebpf object is wrapped in Arc<Mutex> so the firewall
     // watcher and the telemetry sensor can share it.
     let drop_counters = Arc::new(EbpfDropCounters::new());
-    let (firewall, sensor, cancel_tx) = select_firewall_and_sensor(&config, drop_counters.clone());
+    let (firewall, mut sensor, cancel_tx) = select_firewall_and_sensor(&config, drop_counters.clone());
 
     // -----------------------------------------------------------------------
     // Pipeline setup
@@ -70,6 +70,7 @@ async fn main() -> secureexec_generic::error::Result<()> {
 
     let uid_map = load_uid_map();
     pipeline.set_parent_resolver(ProcfsParentResolver::new(uid_map));
+    sensor.set_reconnect_generation(pipeline.reconnect_generation_handle());
     pipeline.add_sensor(sensor);
     pipeline.add_sensor(LinuxAuthSensor::new());
 
