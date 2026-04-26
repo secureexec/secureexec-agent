@@ -180,6 +180,11 @@ pub(super) fn convert_bpf_events(
                 start_time: child_start,
                 container_id: if container_id.is_empty() { None } else { Some(container_id.clone()) },
             });
+            // After fork, the child still maps the parent's executable until
+            // exec() replaces it.  Hash via /proc/{child}/exe — the inode is
+            // identical to the parent's, so this will be a cache-hit in the
+            // vast majority of cases.
+            let (exe_hash, exe_size) = exe_hash_cache.hash_exe(child_pid);
             let mut ev = Event::new(hostname.to_string(), EventKind::ProcessFork(ProcessEvent {
                 pid: child_pid, parent_pid,
                 name: p_name, path: p_path, cmdline: child_cmdline,
@@ -188,8 +193,8 @@ pub(super) fn convert_bpf_events(
                 parent_process_guid: String::new(),
                 exit_code: None,
                 ld_preload: String::new(),
-                exe_hash: String::new(),
-                exe_size: 0,
+                exe_hash,
+                exe_size,
             }));
             ev.username        = username;
             ev.process_user_id = p_uid.to_string();

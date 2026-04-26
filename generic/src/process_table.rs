@@ -157,6 +157,16 @@ impl ProcessTable {
                 let parent_uid = self.lookup(pe.parent_pid, None)
                     .map(|p| p.process_guid.to_string())
                     .unwrap_or_default();
+                // If the sensor couldn't hash the child exe (e.g. /proc race),
+                // fall back to the parent's hash — after fork the child still
+                // shares the same executable until exec() replaces it.
+                let (exe_hash, exe_size) = if pe.exe_hash.is_empty() {
+                    self.lookup(pe.parent_pid, None)
+                        .map(|p| (p.exe_hash.clone(), p.exe_size))
+                        .unwrap_or_else(|| (pe.exe_hash.clone(), pe.exe_size))
+                } else {
+                    (pe.exe_hash.clone(), pe.exe_size)
+                };
                 let info = ProcessInfo {
                     pid: pe.pid,
                     parent_pid: pe.parent_pid,
@@ -170,8 +180,8 @@ impl ProcessTable {
                     exit_time: None,
                     process_guid: puid,
                     parent_process_guid: parent_uid,
-                    exe_hash: pe.exe_hash.clone(),
-                    exe_size: pe.exe_size,
+                    exe_hash,
+                    exe_size,
                 };
                 self.processes.insert(key, info);
                 self.add_pid_index(pe.pid, st);
@@ -492,5 +502,57 @@ mod tests {
         let info = t.lookup(999_999, None).expect("found");
         assert_eq!(info.start_time, truncate_to_millis(ts(10_004)));
         assert_eq!(t.by_pid.get(&999_999).map(|v| v.len()), Some(5));
+    }
+
+    #[test]
+    fn fork_child_inherits_parent_exe_hash_when_own_hash_empty() {
+        let ts = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let mut t = ProcessTable::new("agent".into(), Duration::from_secs(1));
+
+        // Insert a parent process with a known exe_hash.
+        let parent_ev = Event::new(
+            "test-host".into(),
+            EventKind::ProcessCreate(ProcessEvent {
+                pid: 100,
+                parent_pid: 1,
+                name: "bash".into(),
+                path: "/usr/bin/bash".into(),
+                cmdline: "bash".into(),
+                user_id: "0".into(),
+                start_time: ts,
+                snapshot: false,
+                parent_process_guid: String::new(),
+                exit_code: None,
+                ld_preload: String::new(),
+                exe_hash: "deadbeef".into(),
+                exe_size: 12345,
+            }),
+        );
+        t.update(&parent_ev);
+
+        // Fork a child with an empty exe_hash (simulates /proc race).
+        let child_ev = Event::new(
+            "test-host".into(),
+            EventKind::ProcessFork(ProcessEvent {
+                pid: 200,
+                parent_pid: 100,
+                name: "bash".into(),
+                path: "/usr/bin/bash".into(),
+                cmdline: "bash".into(),
+                user_id: "0".into(),
+                start_time: ts + chrono::Duration::milliseconds(10),
+                snapshot: false,
+                parent_process_guid: String::new(),
+                exit_code: None,
+                ld_preload: String::new(),
+                exe_hash: String::new(), // empty — sensor couldn't read /proc in time
+                exe_size: 0,
+            }),
+        );
+        t.update(&child_ev);
+
+        let info = t.lookup(200, None).expect("child entry should exist");
+        assert_eq!(info.exe_hash, "deadbeef", "child should inherit parent exe_hash");
+        assert_eq!(info.exe_size, 12345, "child should inherit parent exe_size");
     }
 }
