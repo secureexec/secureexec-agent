@@ -1,6 +1,7 @@
 pub mod command;
 pub mod config;
 pub mod detection;
+pub mod enrollment;
 pub mod error;
 pub mod event;
 pub mod filter;

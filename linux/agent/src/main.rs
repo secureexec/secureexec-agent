@@ -8,7 +8,7 @@ mod log_tailer;
 mod sensors;
 mod update;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use secureexec_generic::config::AgentConfig;
@@ -25,15 +25,109 @@ use sensors::fanotify::FanotifySensor;
 use sensors::procfs::{load_uid_map, ProcfsParentResolver};
 use update::LinuxAgentUpdater;
 
-const CONFIG_PATH: &str = "secureexec-agent.json";
 const VERSION: &str = include_str!("../version");
+
+/// Bootstrap writes under `/opt/secureexec/etc/certs` — matches packaged layout.
+const ETC_INSTALL_TOKEN: &str = "/etc/secureexec/install-token";
+const ETC_BACKEND_URL: &str = "/etc/secureexec/backend-url";
+const INSTALL_CERT_DIR: &str = "/opt/secureexec/etc/certs";
+
+fn config_path() -> PathBuf {
+    std::env::var("SECUREEXEC_CONFIG_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("secureexec-agent.json"))
+}
+
+async fn maybe_bootstrap(cfg_path: &Path) -> secureexec_generic::error::Result<()> {
+    if cfg_path.exists() {
+        return Ok(());
+    }
+    if !Path::new(ETC_INSTALL_TOKEN).exists() {
+        return Ok(());
+    }
+
+    let install_token = std::fs::read_to_string(ETC_INSTALL_TOKEN)?.trim().to_string();
+    let backend_https = std::fs::read_to_string(ETC_BACKEND_URL)?.trim().to_string();
+    if install_token.is_empty() || backend_https.is_empty() {
+        return Err(secureexec_generic::error::AgentError::Config(
+            "install-token or backend-url is empty".into(),
+        ));
+    }
+
+    let hostname = hostname::get()
+        .map(|h| h.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| "unknown".into());
+    let arch = std::env::consts::ARCH.to_string();
+    let cn = format!("agent-pending-{}", hostname);
+    let (key_pem, csr_pem) =
+        secureexec_generic::enrollment::generate_keypair_and_csr(&cn)?;
+
+    let artifacts = secureexec_generic::enrollment::enroll(
+        &backend_https,
+        &install_token,
+        secureexec_generic::enrollment::EnrollmentRequest {
+            hostname: hostname.clone(),
+            os: "linux".into(),
+            arch,
+            agent_version: VERSION.trim().to_string(),
+        },
+        &key_pem,
+        &csr_pem,
+    )
+    .await?;
+
+    let cert_dir = Path::new(INSTALL_CERT_DIR);
+    std::fs::create_dir_all(cert_dir)?;
+    let key_path = cert_dir.join("agent.key");
+    let cert_path = cert_dir.join("agent.crt");
+    let ca_path = cert_dir.join("ca.crt");
+    std::fs::write(&key_path, &artifacts.client_key_pem)?;
+    std::fs::write(&cert_path, &artifacts.client_cert_pem)?;
+    std::fs::write(&ca_path, &artifacts.ca_cert_pem)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))?;
+    }
+
+    let mut config = AgentConfig::default();
+    config.agent_id = artifacts.agent_id.clone();
+    config.backend_url = artifacts.backend_grpc_url.clone();
+    config.auth_token = Some(artifacts.agent_token.clone());
+    config.tls_ca_cert = Some(ca_path);
+    config.tls_client_cert = Some(cert_path);
+    config.tls_client_key = Some(key_path);
+    if !artifacts.tls_server_name.is_empty() {
+        config.tls_server_name = Some(artifacts.tls_server_name);
+    }
+
+    if let Some(parent) = cfg_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    config.save(cfg_path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // Config file holds `auth_token`; restrict to the service user only.
+        let _ = std::fs::set_permissions(cfg_path, std::fs::Permissions::from_mode(0o600));
+    }
+
+    std::fs::remove_file(ETC_INSTALL_TOKEN)?;
+    info!(
+        agent_id = %config.agent_id,
+        "install-token enrollment complete"
+    );
+    Ok(())
+}
 
 #[tokio::main]
 async fn main() -> secureexec_generic::error::Result<()> {
     let (log_tx, log_rx) = tokio::sync::mpsc::channel(4096);
     secureexec_generic::telemetry::init_with_log_layer(Some(log_tx));
 
-    let config = AgentConfig::load_or_create(Path::new(CONFIG_PATH))?;
+    let cfg_path = config_path();
+    maybe_bootstrap(&cfg_path).await?;
+    let config = AgentConfig::load_or_create(&cfg_path)?;
     info!(
         agent_id = %config.agent_id,
         backend = %config.backend_url,
@@ -66,7 +160,7 @@ async fn main() -> secureexec_generic::error::Result<()> {
         server_name: config.tls_server_name.clone(),
     };
     let transport = GrpcTransport::new(&config.backend_url, tls, config.auth_token.clone());
-    let mut pipeline = Pipeline::new(config.clone(), CONFIG_PATH, VERSION.trim(), transport);
+    let mut pipeline = Pipeline::new(config.clone(), &cfg_path, VERSION.trim(), transport);
 
     let uid_map = load_uid_map();
     pipeline.set_parent_resolver(ProcfsParentResolver::new(uid_map));
