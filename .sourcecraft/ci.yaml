@@ -9,14 +9,30 @@
 #
 # Required secret (Repository settings → Secrets):
 #   REGISTRY_TOKEN — personal access token with package read/write scope.
-#                    Docker login uses the literal username `iam` — only the
-#                    PAT is secret.
+#                    Docker login uses the literal username `iam`.
 #
-# Triggered on every tag push. Built artifacts (.deb / .rpm) are exposed as
-# downloadable cube artifacts (kept for 14 days), and the `agent-files` Docker
-# image is pushed to the SourceCraft registry so prod hosts can pull with:
+# ─── How it works ─────────────────────────────────────────────────────────────
 #
-#   docker pull pkg.sourcecraft.tech/cr/org-secureexec/cn1k0rm79abtdt7ijjgv/agent-files:linux-amd64-<VERSION>
+# Triggered on every tag push.
+#
+# 1. The native cubes on the (jammy 22.04) cloud worker handle docker login,
+#    image-existence check, and the final docker build & push of agent-files.
+#
+# 2. A `build-builder-image` cube ensures a noble-based builder image
+#    (LLVM 20 + nightly Rust + bpf-linker + dpkg-dev + rpm) exists in the
+#    registry under tag $NIGHTLY. It builds & pushes only if missing — once
+#    that image is in the registry, every later workflow run reuses it
+#    (the cube becomes a ~1 s manifest check).
+#
+# 3. The cargo build, .deb and .rpm packaging all run inside that builder
+#    image (`image:` cubes), giving us the noble runtime + every preinstalled
+#    toolchain. This avoids the LLVM 20 / libc6 mismatch on the jammy worker.
+#
+# 4. Built .deb/.rpm artifacts are exposed as cube artifacts (downloadable
+#    from the CI/CD UI for 14 days), and the agent-files Docker image is
+#    pushed to the SourceCraft registry so prod hosts can pull with:
+#
+#      docker pull pkg.sourcecraft.tech/cr/org-secureexec/cn1k0rm79abtdt7ijjgv/agent-files:linux-amd64-<VERSION>
 
 on:
   push:
@@ -32,14 +48,19 @@ workflows:
     env:
       # Pin nightly to a date that uses LLVM 20 (matches llvm-20-dev from apt).
       # Rust 1.90.0-nightly (2025-07-09), LLVM 20.1.7 — verified working.
+      # The builder image is tagged with this exact value, so bumping NIGHTLY
+      # automatically triggers a fresh builder rebuild.
       NIGHTLY: nightly-2025-07-10
 
       # ── SourceCraft Docker registry ──────────────────────────────────────
-      # Push target: pkg.sourcecraft.tech/cr/org-secureexec/cn1k0rm79abtdt7ijjgv/agent-files
+      # Push targets:
+      #   pkg.sourcecraft.tech/cr/org-secureexec/cn1k0rm79abtdt7ijjgv/linux-agent-builder:<NIGHTLY>
+      #   pkg.sourcecraft.tech/cr/org-secureexec/cn1k0rm79abtdt7ijjgv/agent-files:linux-amd64-<VERSION>
       REGISTRY: pkg.sourcecraft.tech
       REGISTRY_ORG: org-secureexec
       REGISTRY_ID: cn1k0rm79abtdt7ijjgv
       IMAGE_REPO: agent-files
+      BUILDER_IMAGE_REPO: linux-agent-builder
 
       # Static linking for musl target.
       RUSTFLAGS: "-C link-arg=-static"
@@ -51,6 +72,8 @@ workflows:
           REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
 
         cubes:
+          # ── Stage 1: native cubes on the jammy worker ────────────────────
+
           - name: read-version
             script:
               - VERSION=$(cat linux/agent/version | tr -d '[:space:]')
@@ -62,6 +85,7 @@ workflows:
               - echo "KMOD_DEB_NAME=secureexec-kmod_${KMOD_VERSION}_all.deb" >> $SOURCECRAFT_ENV
               - echo "KMOD_RPM_NAME=secureexec-kmod-${KMOD_VERSION}-1.noarch.rpm" >> $SOURCECRAFT_ENV
               - echo "IMAGE=${REGISTRY}/cr/${REGISTRY_ORG}/${REGISTRY_ID}/${IMAGE_REPO}:linux-amd64-${VERSION}" >> $SOURCECRAFT_ENV
+              - echo "BUILDER_IMG=${REGISTRY}/cr/${REGISTRY_ORG}/${REGISTRY_ID}/${BUILDER_IMAGE_REPO}:${NIGHTLY}" >> $SOURCECRAFT_ENV
 
           - name: registry-login
             if: env.REGISTRY_TOKEN != ""
@@ -79,71 +103,72 @@ workflows:
                   echo "SKIP=false" >> $SOURCECRAFT_ENV
                 fi
 
-          - name: install-llvm-and-system-deps
+          - name: build-builder-image
             script:
               - |
                 if [ "$SKIP" = "true" ]; then
-                  echo "SKIP=true → cube self-skipped (image already in registry)."
+                  echo "SKIP=true → builder image not needed for this run."
                   exit 0
                 fi
-              - wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/llvm.asc >/dev/null
-              - echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-20 main" | sudo tee /etc/apt/sources.list.d/llvm20.list
-              - sudo apt-get update
-              - sudo apt-get install -y llvm-20-dev clang libelf-dev dpkg-dev protobuf-compiler musl-tools dkms rpm
 
-          - name: install-rust-nightly
-            script:
-              - |
-                if [ "$SKIP" = "true" ]; then
-                  echo "SKIP=true → cube self-skipped (image already in registry)."
+                if docker manifest inspect "$BUILDER_IMG" > /dev/null 2>&1; then
+                  echo "Builder image $BUILDER_IMG already exists — reusing."
                   exit 0
                 fi
-              - rustup toolchain install ${NIGHTLY} --component rust-src
-              # Add musl target to both stable (used by cargo build) and the pinned nightly
-              - rustup target add x86_64-unknown-linux-musl
-              - rustup target add x86_64-unknown-linux-musl --toolchain ${NIGHTLY}
-              # aya-build invokes `rustup run nightly ...`; remove the generic
-              # nightly (if any) and symlink our pinned version in its place.
-              - rustup toolchain uninstall nightly 2>/dev/null || true
-              - ln -sf "$HOME/.rustup/toolchains/${NIGHTLY}-x86_64-unknown-linux-gnu" "$HOME/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu"
-              - rustup run nightly rustc -vV | head -4
 
-          - name: install-bpf-linker
-            env:
-              LLVM_PREFIX: /usr/lib/llvm-20
-              RUSTFLAGS: ""
-            script:
-              - |
-                if [ "$SKIP" = "true" ]; then
-                  echo "SKIP=true → cube self-skipped (image already in registry)."
-                  exit 0
-                fi
-              - if ! command -v bpf-linker > /dev/null 2>&1; then cargo install --no-default-features --features llvm-20 bpf-linker; fi
+                echo "Builder image $BUILDER_IMG missing — building & pushing (one-off, ~10 min)."
+                # --provenance=false / --sbom=false: SourceCraft registry
+                # (Yandex Container Registry) rejects the OCI image-index
+                # manifest format buildx produces by default; these flags
+                # force a plain Docker v2 manifest that YCR accepts.
+                docker build \
+                  --platform linux/amd64 \
+                  --provenance=false \
+                  --sbom=false \
+                  --build-arg NIGHTLY="${NIGHTLY}" \
+                  -f docker/linux-agent-builder.Dockerfile \
+                  -t "$BUILDER_IMG" \
+                  .
+                docker push "$BUILDER_IMG"
+                echo "Pushed: $BUILDER_IMG"
+
+          # ── Stage 2: cargo build inside the noble builder image ──────────
 
           - name: build-linux-agent-static-musl
-            env:
-              CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: x86_64-linux-musl-gcc
+            image:
+              name: pkg.sourcecraft.tech/cr/org-secureexec/cn1k0rm79abtdt7ijjgv/linux-agent-builder:nightly-2025-07-10
+              username: iam
+              password: ${{ secrets.REGISTRY_TOKEN }}
             script:
               - |
                 if [ "$SKIP" = "true" ]; then
                   echo "SKIP=true → cube self-skipped (image already in registry)."
                   exit 0
                 fi
-              - |
-                cargo build --release --manifest-path Cargo.toml -p secureexec-linux --target x86_64-unknown-linux-musl
+                cd "$SOURCECRAFT_WORKSPACE"
+                cargo build --release --manifest-path Cargo.toml -p secureexec-linux \
+                  --target x86_64-unknown-linux-musl
                 # Verify it's fully static (ldd prints "statically linked" for static binaries)
-                ldd target/x86_64-unknown-linux-musl/release/secureexec-agent-linux 2>&1 | grep -q "statically linked" \
+                ldd target/x86_64-unknown-linux-musl/release/secureexec-agent-linux 2>&1 \
+                  | grep -q "statically linked" \
                   && echo "OK: fully static binary" \
                   || echo "WARNING: binary is not fully static"
 
+          # ── Stage 3: package as .deb / .rpm inside the same builder image ─
+
           - name: package-agent-deb
+            image:
+              name: pkg.sourcecraft.tech/cr/org-secureexec/cn1k0rm79abtdt7ijjgv/linux-agent-builder:nightly-2025-07-10
+              username: iam
+              password: ${{ secrets.REGISTRY_TOKEN }}
             script:
               - |
                 if [ "$SKIP" = "true" ]; then
                   echo "SKIP=true → cube self-skipped (image already in registry)."
                   exit 0
                 fi
-              - |
+                cd "$SOURCECRAFT_WORKSPACE"
+
                 INSTALL_DIR=/opt/secureexec
                 DEB_STAGE=$(mktemp -d)
 
@@ -168,7 +193,7 @@ workflows:
                 Priority: optional
                 Section: admin
                 EOF
-                sed -i 's/^              //' "$DEB_STAGE/DEBIAN/control"
+                sed -i 's/^                //' "$DEB_STAGE/DEBIAN/control"
 
                 cat > "$DEB_STAGE/etc/systemd/system/secureexec-agent.service" <<EOF
                 [Unit]
@@ -187,7 +212,7 @@ workflows:
                 [Install]
                 WantedBy=multi-user.target
                 EOF
-                sed -i 's/^              //' "$DEB_STAGE/etc/systemd/system/secureexec-agent.service"
+                sed -i 's/^                //' "$DEB_STAGE/etc/systemd/system/secureexec-agent.service"
 
                 cat > "$DEB_STAGE/DEBIAN/postinst" <<'EOF'
                 #!/bin/sh
@@ -198,7 +223,7 @@ workflows:
                 systemctl start secureexec-agent.service || true
                 echo "SecureExec agent installed and started."
                 EOF
-                sed -i 's/^              //' "$DEB_STAGE/DEBIAN/postinst"
+                sed -i 's/^                //' "$DEB_STAGE/DEBIAN/postinst"
                 chmod 755 "$DEB_STAGE/DEBIAN/postinst"
 
                 cat > "$DEB_STAGE/DEBIAN/prerm" <<'EOF'
@@ -207,7 +232,7 @@ workflows:
                 systemctl stop secureexec-agent.service 2>/dev/null || true
                 systemctl disable secureexec-agent.service 2>/dev/null || true
                 EOF
-                sed -i 's/^              //' "$DEB_STAGE/DEBIAN/prerm"
+                sed -i 's/^                //' "$DEB_STAGE/DEBIAN/prerm"
                 chmod 755 "$DEB_STAGE/DEBIAN/prerm"
 
                 dpkg-deb --build "$DEB_STAGE" "$DEB_NAME"
@@ -218,13 +243,18 @@ workflows:
                 - "secureexec-agent_*_amd64.deb"
 
           - name: package-agent-rpm
+            image:
+              name: pkg.sourcecraft.tech/cr/org-secureexec/cn1k0rm79abtdt7ijjgv/linux-agent-builder:nightly-2025-07-10
+              username: iam
+              password: ${{ secrets.REGISTRY_TOKEN }}
             script:
               - |
                 if [ "$SKIP" = "true" ]; then
                   echo "SKIP=true → cube self-skipped (image already in registry)."
                   exit 0
                 fi
-              - |
+                cd "$SOURCECRAFT_WORKSPACE"
+
                 INSTALL_DIR=/opt/secureexec
 
                 mkdir -p ~/rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
@@ -284,7 +314,7 @@ workflows:
                 systemctl stop secureexec-agent.service 2>/dev/null || true
                 systemctl disable secureexec-agent.service 2>/dev/null || true
                 EOF
-                sed -i 's/^              //' ~/rpmbuild/SPECS/secureexec-agent.spec
+                sed -i 's/^                //' ~/rpmbuild/SPECS/secureexec-agent.spec
 
                 rpmbuild -bb ~/rpmbuild/SPECS/secureexec-agent.spec
                 cp ~/rpmbuild/RPMS/x86_64/"$RPM_NAME" .
@@ -294,13 +324,18 @@ workflows:
                 - "secureexec-agent-*-1.x86_64.rpm"
 
           - name: package-kmod-deb
+            image:
+              name: pkg.sourcecraft.tech/cr/org-secureexec/cn1k0rm79abtdt7ijjgv/linux-agent-builder:nightly-2025-07-10
+              username: iam
+              password: ${{ secrets.REGISTRY_TOKEN }}
             script:
               - |
                 if [ "$SKIP" = "true" ]; then
                   echo "SKIP=true → cube self-skipped (image already in registry)."
                   exit 0
                 fi
-              - |
+                cd "$SOURCECRAFT_WORKSPACE"
+
                 DEB_STAGE=$(mktemp -d)
 
                 mkdir -p "$DEB_STAGE/DEBIAN"
@@ -326,7 +361,7 @@ workflows:
                 Priority: optional
                 Section: kernel
                 EOF
-                sed -i 's/^              //' "$DEB_STAGE/DEBIAN/control"
+                sed -i 's/^                //' "$DEB_STAGE/DEBIAN/control"
 
                 cat > "$DEB_STAGE/DEBIAN/postinst" <<EOF
                 #!/bin/sh
@@ -340,7 +375,7 @@ workflows:
                 modprobe secureexec_kmod 2>/dev/null || true
                 echo "secureexec-kmod installed."
                 EOF
-                sed -i 's/^              //' "$DEB_STAGE/DEBIAN/postinst"
+                sed -i 's/^                //' "$DEB_STAGE/DEBIAN/postinst"
                 chmod 755 "$DEB_STAGE/DEBIAN/postinst"
 
                 cat > "$DEB_STAGE/DEBIAN/prerm" <<EOF
@@ -350,7 +385,7 @@ workflows:
                 rmmod secureexec_kmod 2>/dev/null || true
                 dkms remove -m secureexec-kmod -v "\${KMOD_VER}" --all 2>/dev/null || true
                 EOF
-                sed -i 's/^              //' "$DEB_STAGE/DEBIAN/prerm"
+                sed -i 's/^                //' "$DEB_STAGE/DEBIAN/prerm"
                 chmod 755 "$DEB_STAGE/DEBIAN/prerm"
 
                 dpkg-deb --build "$DEB_STAGE" "$KMOD_DEB_NAME"
@@ -361,13 +396,18 @@ workflows:
                 - "secureexec-kmod_*_all.deb"
 
           - name: package-kmod-rpm
+            image:
+              name: pkg.sourcecraft.tech/cr/org-secureexec/cn1k0rm79abtdt7ijjgv/linux-agent-builder:nightly-2025-07-10
+              username: iam
+              password: ${{ secrets.REGISTRY_TOKEN }}
             script:
               - |
                 if [ "$SKIP" = "true" ]; then
                   echo "SKIP=true → cube self-skipped (image already in registry)."
                   exit 0
                 fi
-              - |
+                cd "$SOURCECRAFT_WORKSPACE"
+
                 mkdir -p ~/rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
                 cp linux/kmod/main.c     ~/rpmbuild/SOURCES/
                 cp linux/kmod/firewall.c ~/rpmbuild/SOURCES/
@@ -416,7 +456,7 @@ workflows:
                 rmmod secureexec_kmod 2>/dev/null || true
                 dkms remove -m secureexec-kmod -v "\${KMOD_VER}" --all 2>/dev/null || true
                 EOF
-                sed -i 's/^              //' ~/rpmbuild/SPECS/secureexec-kmod.spec
+                sed -i 's/^                //' ~/rpmbuild/SPECS/secureexec-kmod.spec
 
                 rpmbuild -bb ~/rpmbuild/SPECS/secureexec-kmod.spec
                 cp ~/rpmbuild/RPMS/noarch/"$KMOD_RPM_NAME" .
@@ -425,7 +465,7 @@ workflows:
               paths:
                 - "secureexec-kmod-*-1.noarch.rpm"
 
-          # ── Docker image: init container that seeds the shared agents host-path ──
+          # ── Stage 4: build & push agent-files Docker image (native) ──────
           # Pushed to pkg.sourcecraft.tech so prod hosts can pull from
           #   pkg.sourcecraft.tech/cr/org-secureexec/cn1k0rm79abtdt7ijjgv/agent-files:linux-amd64-${VERSION}
 
@@ -437,7 +477,7 @@ workflows:
                   echo "SKIP=true → cube self-skipped (image already in registry)."
                   exit 0
                 fi
-              - |
+
                 # Collect all linux/amd64 packages into pkg/ with versioned canonical names.
                 # The Dockerfile CMD will create versionless symlinks at runtime.
                 mkdir -p pkg
@@ -446,7 +486,12 @@ workflows:
                 cp "$KMOD_DEB_NAME" pkg/secureexec-kmod_linux_all_${KMOD_VERSION}.deb
                 cp "$KMOD_RPM_NAME" pkg/secureexec-kmod_linux_noarch_${KMOD_VERSION}.rpm
 
+                # --provenance=false / --sbom=false: required for the
+                # SourceCraft (Yandex Container) registry, which rejects
+                # buildx's default OCI image-index manifest.
                 docker build \
+                  --provenance=false \
+                  --sbom=false \
                   -f docker/agent-files.Dockerfile \
                   --build-arg VERSION="${VERSION}" \
                   -t "$IMAGE" \

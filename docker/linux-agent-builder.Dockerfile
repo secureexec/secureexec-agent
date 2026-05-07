@@ -34,7 +34,10 @@ RUN apt-get update && \
         curl \
         git \
         pkg-config \
-        build-essential && \
+        build-essential \
+        dpkg-dev \
+        rpm \
+        dkms && \
     rm -rf /var/lib/apt/lists/*
 
 ENV LLVM_PREFIX=/usr/lib/llvm-20
