@@ -237,10 +237,11 @@ workflows:
 
                 dpkg-deb --build "$DEB_STAGE" "$DEB_NAME"
                 rm -rf "$DEB_STAGE"
+                cp "$DEB_NAME" secureexec-agent.deb
                 echo "Built: $DEB_NAME"
             artifacts:
               paths:
-                - "secureexec-agent_*_amd64.deb"
+                - secureexec-agent.deb
 
           - name: package-agent-rpm
             image:
@@ -257,7 +258,7 @@ workflows:
 
                 INSTALL_DIR=/opt/secureexec
 
-                mkdir -p ~/rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
+                mkdir -p ~/rpmbuild/BUILD ~/rpmbuild/RPMS ~/rpmbuild/SOURCES ~/rpmbuild/SPECS ~/rpmbuild/SRPMS
                 cp target/x86_64-unknown-linux-musl/release/secureexec-agent-linux ~/rpmbuild/SOURCES/
 
                 UNITDIR=/usr/lib/systemd/system
@@ -318,10 +319,11 @@ workflows:
 
                 rpmbuild -bb ~/rpmbuild/SPECS/secureexec-agent.spec
                 cp ~/rpmbuild/RPMS/x86_64/"$RPM_NAME" .
+                cp "$RPM_NAME" secureexec-agent.rpm
                 echo "Built: $RPM_NAME"
             artifacts:
               paths:
-                - "secureexec-agent-*-1.x86_64.rpm"
+                - secureexec-agent.rpm
 
           - name: package-kmod-deb
             image:
@@ -390,10 +392,11 @@ workflows:
 
                 dpkg-deb --build "$DEB_STAGE" "$KMOD_DEB_NAME"
                 rm -rf "$DEB_STAGE"
+                cp "$KMOD_DEB_NAME" secureexec-kmod.deb
                 echo "Built: $KMOD_DEB_NAME"
             artifacts:
               paths:
-                - "secureexec-kmod_*_all.deb"
+                - secureexec-kmod.deb
 
           - name: package-kmod-rpm
             image:
@@ -408,7 +411,7 @@ workflows:
                 fi
                 cd "$SOURCECRAFT_WORKSPACE"
 
-                mkdir -p ~/rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
+                mkdir -p ~/rpmbuild/BUILD ~/rpmbuild/RPMS ~/rpmbuild/SOURCES ~/rpmbuild/SPECS ~/rpmbuild/SRPMS
                 cp linux/kmod/main.c     ~/rpmbuild/SOURCES/
                 cp linux/kmod/firewall.c ~/rpmbuild/SOURCES/
                 cp linux/kmod/firewall.h ~/rpmbuild/SOURCES/
@@ -460,10 +463,11 @@ workflows:
 
                 rpmbuild -bb ~/rpmbuild/SPECS/secureexec-kmod.spec
                 cp ~/rpmbuild/RPMS/noarch/"$KMOD_RPM_NAME" .
+                cp "$KMOD_RPM_NAME" secureexec-kmod.rpm
                 echo "Built: $KMOD_RPM_NAME"
             artifacts:
               paths:
-                - "secureexec-kmod-*-1.noarch.rpm"
+                - secureexec-kmod.rpm
 
           # ── Stage 4: build & push agent-files Docker image (native) ──────
           # Pushed to pkg.sourcecraft.tech so prod hosts can pull from
