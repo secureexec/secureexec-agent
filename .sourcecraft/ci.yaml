@@ -72,23 +72,32 @@ workflows:
             script:
               - |
                 if docker manifest inspect "$IMAGE" > /dev/null 2>&1; then
-                  echo "Image $IMAGE already exists, skipping build."
+                  echo "Image $IMAGE already exists in registry — downstream cubes will self-skip."
                   echo "SKIP=true" >> $SOURCECRAFT_ENV
                 else
+                  echo "Image $IMAGE not in registry — will build & push."
                   echo "SKIP=false" >> $SOURCECRAFT_ENV
                 fi
 
           - name: install-llvm-and-system-deps
-            if: env.SKIP != "true"
             script:
+              - |
+                if [ "$SKIP" = "true" ]; then
+                  echo "SKIP=true → cube self-skipped (image already in registry)."
+                  exit 0
+                fi
               - wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/llvm.asc >/dev/null
               - echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-20 main" | sudo tee /etc/apt/sources.list.d/llvm20.list
               - sudo apt-get update
               - sudo apt-get install -y llvm-20-dev clang libelf-dev dpkg-dev protobuf-compiler musl-tools dkms rpm
 
           - name: install-rust-nightly
-            if: env.SKIP != "true"
             script:
+              - |
+                if [ "$SKIP" = "true" ]; then
+                  echo "SKIP=true → cube self-skipped (image already in registry)."
+                  exit 0
+                fi
               - rustup toolchain install ${NIGHTLY} --component rust-src
               # Add musl target to both stable (used by cargo build) and the pinned nightly
               - rustup target add x86_64-unknown-linux-musl
@@ -100,18 +109,26 @@ workflows:
               - rustup run nightly rustc -vV | head -4
 
           - name: install-bpf-linker
-            if: env.SKIP != "true"
             env:
               LLVM_PREFIX: /usr/lib/llvm-20
               RUSTFLAGS: ""
             script:
+              - |
+                if [ "$SKIP" = "true" ]; then
+                  echo "SKIP=true → cube self-skipped (image already in registry)."
+                  exit 0
+                fi
               - if ! command -v bpf-linker > /dev/null 2>&1; then cargo install --no-default-features --features llvm-20 bpf-linker; fi
 
           - name: build-linux-agent-static-musl
-            if: env.SKIP != "true"
             env:
               CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: x86_64-linux-musl-gcc
             script:
+              - |
+                if [ "$SKIP" = "true" ]; then
+                  echo "SKIP=true → cube self-skipped (image already in registry)."
+                  exit 0
+                fi
               - |
                 cargo build --release --manifest-path Cargo.toml -p secureexec-linux --target x86_64-unknown-linux-musl
                 # Verify it's fully static (ldd prints "statically linked" for static binaries)
@@ -120,8 +137,12 @@ workflows:
                   || echo "WARNING: binary is not fully static"
 
           - name: package-agent-deb
-            if: env.SKIP != "true"
             script:
+              - |
+                if [ "$SKIP" = "true" ]; then
+                  echo "SKIP=true → cube self-skipped (image already in registry)."
+                  exit 0
+                fi
               - |
                 INSTALL_DIR=/opt/secureexec
                 DEB_STAGE=$(mktemp -d)
@@ -197,8 +218,12 @@ workflows:
                 - "secureexec-agent_*_amd64.deb"
 
           - name: package-agent-rpm
-            if: env.SKIP != "true"
             script:
+              - |
+                if [ "$SKIP" = "true" ]; then
+                  echo "SKIP=true → cube self-skipped (image already in registry)."
+                  exit 0
+                fi
               - |
                 INSTALL_DIR=/opt/secureexec
 
@@ -269,8 +294,12 @@ workflows:
                 - "secureexec-agent-*-1.x86_64.rpm"
 
           - name: package-kmod-deb
-            if: env.SKIP != "true"
             script:
+              - |
+                if [ "$SKIP" = "true" ]; then
+                  echo "SKIP=true → cube self-skipped (image already in registry)."
+                  exit 0
+                fi
               - |
                 DEB_STAGE=$(mktemp -d)
 
@@ -332,8 +361,12 @@ workflows:
                 - "secureexec-kmod_*_all.deb"
 
           - name: package-kmod-rpm
-            if: env.SKIP != "true"
             script:
+              - |
+                if [ "$SKIP" = "true" ]; then
+                  echo "SKIP=true → cube self-skipped (image already in registry)."
+                  exit 0
+                fi
               - |
                 mkdir -p ~/rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
                 cp linux/kmod/main.c     ~/rpmbuild/SOURCES/
@@ -397,8 +430,13 @@ workflows:
           #   pkg.sourcecraft.tech/cr/org-secureexec/cn1k0rm79abtdt7ijjgv/agent-files:linux-amd64-${VERSION}
 
           - name: build-and-push-agent-files-image
-            if: env.SKIP != "true" && env.REGISTRY_TOKEN != ""
+            if: env.REGISTRY_TOKEN != ""
             script:
+              - |
+                if [ "$SKIP" = "true" ]; then
+                  echo "SKIP=true → cube self-skipped (image already in registry)."
+                  exit 0
+                fi
               - |
                 # Collect all linux/amd64 packages into pkg/ with versioned canonical names.
                 # The Dockerfile CMD will create versionless symlinks at runtime.
