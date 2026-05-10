@@ -3,6 +3,7 @@ mod constants;
 mod detached_script;
 mod ebpf_firewall;
 mod firewall;
+mod host_exec;
 mod kmod;
 mod log_tailer;
 mod sensors;

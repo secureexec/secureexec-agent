@@ -457,7 +457,11 @@ async fn heartbeat_loop(
     }
 }
 
-const COMMAND_POLL_INTERVAL_SECS: u64 = 10;
+/// How often the agent polls the server for new commands. Lower than the
+/// rule-poll cadence because some commands (host-exec) live inside an AI
+/// loop where every extra second of latency burns iteration budget. The
+/// per-poll request is tiny (empty array on idle hosts), so 2s is fine.
+const COMMAND_POLL_INTERVAL_SECS: u64 = 2;
 /// Interval between target-version checks (update task).
 const UPDATE_CHECK_INTERVAL_SECS: u64 = 30;
 /// Max random delay (seconds) before starting update, to spread load across a fleet.
@@ -620,15 +624,27 @@ async fn command_poll_loop(
                 let id = cmd.command_id.clone();
                 info!(command_id = %id, command_type = %cmd.command_type, "dispatching command");
                 match handler.handle(&cmd).await {
-                    Ok(()) => {
-                        if let Err(e) = ctrl.ack_command(&agent_id, &id, true, "").await {
+                    Ok(outcome) => {
+                        if let Err(e) = ctrl
+                            .ack_command(&agent_id, &id, true, "", &outcome)
+                            .await
+                        {
                             warn!(error = %e, command_id = %id, "ack_command failed");
                         }
                     }
                     Err(e) => {
                         warn!(error = %e, command_id = %id, "command handler failed");
                         let err_str = e.to_string();
-                        if let Err(ae) = ctrl.ack_command(&agent_id, &id, false, &err_str).await {
+                        if let Err(ae) = ctrl
+                            .ack_command(
+                                &agent_id,
+                                &id,
+                                false,
+                                &err_str,
+                                &crate::command::CommandOutcome::default(),
+                            )
+                            .await
+                        {
                             warn!(error = %ae, command_id = %id, "ack_command failed");
                         }
                     }

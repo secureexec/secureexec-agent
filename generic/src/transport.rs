@@ -473,8 +473,17 @@ impl GrpcControlClient {
         Ok(())
     }
 
-    /// Acknowledge a command execution result.
-    pub async fn ack_command(&self, agent_id: &str, command_id: &str, success: bool, error_msg: &str) -> Result<()> {
+    /// Acknowledge a command execution result. `outcome` carries optional
+    /// captured output for host-exec commands; pass `&Default::default()`
+    /// for legacy commands that have no stdout/stderr to report.
+    pub async fn ack_command(
+        &self,
+        agent_id: &str,
+        command_id: &str,
+        success: bool,
+        error_msg: &str,
+        outcome: &crate::command::CommandOutcome,
+    ) -> Result<()> {
         let mut client = match self.get_client().await {
             Ok(c) => c,
             Err(e) => {
@@ -487,6 +496,11 @@ impl GrpcControlClient {
             command_id: command_id.to_string(),
             success,
             error_message: error_msg.to_string(),
+            stdout: outcome.stdout.clone(),
+            stderr: outcome.stderr.clone(),
+            exit_code: outcome.exit_code,
+            truncated: outcome.truncated,
+            duration_ms: outcome.duration_ms,
         });
         match client.ack_command(req).await {
             Ok(_) => Ok(()),

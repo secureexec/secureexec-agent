@@ -8,9 +8,11 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use tracing::{debug, info, warn};
 
-use secureexec_generic::command::{AgentCommand, CommandHandler};
+use secureexec_generic::command::{AgentCommand, CommandHandler, CommandOutcome};
 use secureexec_generic::error::{AgentError, Result};
 use secureexec_generic::process_table::ProcessTable;
+
+use crate::host_exec;
 
 use std::path::Path;
 
@@ -188,7 +190,35 @@ impl Default for IsolatePayload {
 
 #[async_trait]
 impl CommandHandler for LinuxCommandHandler {
-    async fn handle(&self, cmd: &AgentCommand) -> Result<()> {
+    async fn handle(&self, cmd: &AgentCommand) -> Result<CommandOutcome> {
+        // Read-only host-exec commands are entirely self-contained: they
+        // build their own argv, run a binary, and return captured output as
+        // the ack outcome. Dispatch them before the firewall/process-table
+        // commands so we don't need to thread state through `host_exec`.
+        if host_exec::is_host_exec_command(&cmd.command_type) {
+            let out = host_exec::run(&cmd.command_type, &cmd.payload).await;
+            // Distinguish "validation failed before we ran anything" from
+            // "we ran the command but it timed out / was killed". The first
+            // case has nothing useful to ship; the second does (we may have
+            // captured up to STDOUT_CAP bytes before the wall-clock fired).
+            let has_output = !out.stdout.is_empty() || !out.stderr.is_empty();
+            if !out.error_message.is_empty() && !has_output {
+                return Err(AgentError::Platform(format!(
+                    "{}: {}",
+                    cmd.command_type, out.error_message
+                )));
+            }
+            // For partial-success cases (timeout with captured bytes) we
+            // still return Ok so the analyst sees what we got. The non-zero
+            // `exit_code` (124 on timeout) makes the failure obvious.
+            return Ok(CommandOutcome {
+                stdout: out.stdout,
+                stderr: out.stderr,
+                exit_code: out.exit_code,
+                truncated: out.truncated,
+                duration_ms: out.duration_ms,
+            });
+        }
         match cmd.command_type.as_str() {
             "isolate_host" => {
                 let fw = self.firewall.as_ref().ok_or_else(|| {
@@ -242,7 +272,7 @@ impl CommandHandler for LinuxCommandHandler {
 
                 fw.isolate(&extra_rules)?;
                 info!("host isolated via command {}", cmd.command_id);
-                Ok(())
+                Ok(CommandOutcome::default())
             }
 
             "release_host" => {
@@ -251,7 +281,7 @@ impl CommandHandler for LinuxCommandHandler {
                 })?;
                 fw.release()?;
                 info!("host released from isolation via command {}", cmd.command_id);
-                Ok(())
+                Ok(CommandOutcome::default())
             }
 
             "uninstall" => {
@@ -276,7 +306,7 @@ impl CommandHandler for LinuxCommandHandler {
                 match spawn_detached_logged(&script, "agent-delete") {
                     Ok(log_path) => {
                         tokio::spawn(tail_script_log(log_path, "agent-delete".to_string(), None));
-                        Ok(())
+                        Ok(CommandOutcome::default())
                     }
                     Err(e) => {
                         warn!(error = %e, "failed to spawn uninstall script");
@@ -335,7 +365,7 @@ impl CommandHandler for LinuxCommandHandler {
                         warn!(pid, error = %e, "failed to kill process in subtree");
                     }
                 }
-                Ok(())
+                Ok(CommandOutcome::default())
             }
 
             other => {

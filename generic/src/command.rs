@@ -16,6 +16,21 @@ pub struct AgentCommand {
     pub payload: String,
 }
 
+/// Side-channel data a command handler can attach to its ack. Carries the
+/// captured stdout / stderr / exit info from read-only host-exec commands
+/// (`host_list_files`, `host_read_file`, …). Legacy commands like
+/// `isolate_host` ignore this and let the default values flow through —
+/// the proto fields are zero-valued in that case, which the server already
+/// treats as "no output captured".
+#[derive(Debug, Clone, Default)]
+pub struct CommandOutcome {
+    pub stdout: String,
+    pub stderr: String,
+    pub exit_code: i32,
+    pub truncated: bool,
+    pub duration_ms: i64,
+}
+
 /// Platform-specific command execution.
 ///
 /// The Linux implementation drives the secureexec_kmod ioctl interface.
@@ -23,8 +38,10 @@ pub struct AgentCommand {
 /// an appropriate error.
 #[async_trait]
 pub trait CommandHandler: Send + Sync + 'static {
-    /// Execute a command and return Ok(()) on success.
-    async fn handle(&self, cmd: &AgentCommand) -> Result<()>;
+    /// Execute a command and return Ok(outcome) on success. Most legacy
+    /// command types return `CommandOutcome::default()`; only the host-exec
+    /// commands populate the stdout/stderr/exit_code fields.
+    async fn handle(&self, cmd: &AgentCommand) -> Result<CommandOutcome>;
 
     /// Report current network isolation state (for heartbeat telemetry).
     /// Returns false if isolation is not supported on this platform.
@@ -67,7 +84,7 @@ pub struct NoopCommandHandler;
 
 #[async_trait]
 impl CommandHandler for NoopCommandHandler {
-    async fn handle(&self, cmd: &AgentCommand) -> Result<()> {
+    async fn handle(&self, cmd: &AgentCommand) -> Result<CommandOutcome> {
         // Return an explicit error rather than a silent Ok(()). Previously
         // commands would be ack'd as "succeeded" on a platform that has no
         // handler wired up, making it impossible for the server to tell the
