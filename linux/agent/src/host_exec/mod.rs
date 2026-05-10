@@ -1,7 +1,8 @@
 //! Read-only "live response" host commands the AI investigation/chat agent
-//! can run on a Linux endpoint during a case investigation. Five tools, each
-//! built on a real binary (`ls`, `cat`/`head`/`tail`, `grep`, `find`, `ps`)
-//! invoked via `argv` — **never** through a shell.
+//! can run on a Linux endpoint during a case investigation. Each tool is
+//! built on a real binary (`ls`, `cat`/`head`/`tail`, `grep`, `find`, `ps`,
+//! `journalctl`, `lsof`, `ss`, `stat`, `sha256sum`+`file`, `lsmod`, `last`/
+//! `lastlog`/`who`, `ip`) invoked via `argv` — **never** through a shell.
 //!
 //! See `agent/linux/agent/src/host_exec/validate.rs` for path/pattern checks
 //! and `limits.rs` for runtime/output caps.
@@ -50,6 +51,14 @@ pub fn is_host_exec_command(command_type: &str) -> bool {
             | "host_search_files"
             | "host_find_files"
             | "host_list_processes"
+            | "host_read_journal"
+            | "host_list_open_files"
+            | "host_list_sockets"
+            | "host_stat_file"
+            | "host_hash_file"
+            | "host_list_modules"
+            | "host_login_history"
+            | "host_show_network"
     )
 }
 
@@ -90,6 +99,40 @@ async fn dispatch(command_type: &str, payload: &str) -> Result<HostExecOutput, H
             let args: runners::ListProcessesArgs = parse_payload(payload)?;
             runners::run_list_processes(&args).await
         }
+        "host_read_journal" => {
+            let args: runners::ReadJournalArgs = parse_payload(payload)?;
+            runners::run_read_journal(&args).await
+        }
+        "host_list_open_files" => {
+            let args: runners::ListOpenFilesArgs = parse_payload(payload)?;
+            runners::run_list_open_files(&args).await
+        }
+        "host_list_sockets" => {
+            // Empty `{}` is a valid payload — every field has a default —
+            // so we route through `parse_payload_or_default`.
+            let args: runners::ListSocketsArgs = parse_payload_or_default(payload)?;
+            runners::run_list_sockets(&args).await
+        }
+        "host_stat_file" => {
+            let args: runners::StatFileArgs = parse_payload(payload)?;
+            runners::run_stat_file(&args).await
+        }
+        "host_hash_file" => {
+            let args: runners::HashFileArgs = parse_payload(payload)?;
+            runners::run_hash_file(&args).await
+        }
+        "host_list_modules" => {
+            let args: runners::ListModulesArgs = parse_payload_or_default(payload)?;
+            runners::run_list_modules(&args).await
+        }
+        "host_login_history" => {
+            let args: runners::LoginHistoryArgs = parse_payload(payload)?;
+            runners::run_login_history(&args).await
+        }
+        "host_show_network" => {
+            let args: runners::ShowNetworkArgs = parse_payload(payload)?;
+            runners::run_show_network(&args).await
+        }
         other => Err(HostExecError::BadPayload(format!(
             "not a host-exec command: {other}"
         ))),
@@ -103,6 +146,22 @@ fn parse_payload<T: for<'de> Deserialize<'de>>(payload: &str) -> Result<T, HostE
     serde_json::from_str(payload).map_err(|e| HostExecError::BadPayload(e.to_string()))
 }
 
+/// Like [`parse_payload`] but treats an empty / missing body as `{}`.
+/// Used for tools whose every field has a `#[serde(default)]` so that an
+/// LLM legitimately calling the tool with no args (e.g.
+/// `host_list_modules`, `host_list_sockets` in default mode) doesn't
+/// trip the empty-payload guard.
+fn parse_payload_or_default<T: for<'de> Deserialize<'de>>(
+    payload: &str,
+) -> Result<T, HostExecError> {
+    let body = if payload.trim().is_empty() {
+        "{}"
+    } else {
+        payload
+    };
+    serde_json::from_str(body).map_err(|e| HostExecError::BadPayload(e.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -111,6 +170,122 @@ mod tests {
     fn dispatch_rejects_unknown_command() {
         assert!(!is_host_exec_command("isolate_host"));
         assert!(is_host_exec_command("host_list_files"));
+        assert!(is_host_exec_command("host_read_journal"));
+        assert!(is_host_exec_command("host_list_open_files"));
+        assert!(is_host_exec_command("host_list_sockets"));
+        assert!(is_host_exec_command("host_stat_file"));
+        assert!(is_host_exec_command("host_hash_file"));
+        assert!(is_host_exec_command("host_list_modules"));
+        assert!(is_host_exec_command("host_login_history"));
+        assert!(is_host_exec_command("host_show_network"));
+    }
+
+    #[tokio::test]
+    async fn list_open_files_requires_at_least_one_filter() {
+        let out = run("host_list_open_files", "{}").await;
+        assert!(
+            out.error_message.contains("at least one of pid, port, or path"),
+            "expected unfiltered-rejection, got: {}",
+            out.error_message
+        );
+    }
+
+    #[tokio::test]
+    async fn list_open_files_validates_proto_choice() {
+        let out = run(
+            "host_list_open_files",
+            r#"{"port":80,"proto":"raw"}"#,
+        )
+        .await;
+        assert!(
+            out.error_message.contains("proto must be one of"),
+            "expected proto validation, got: {}",
+            out.error_message
+        );
+    }
+
+    #[tokio::test]
+    async fn list_sockets_requires_tcp_or_udp() {
+        let out = run(
+            "host_list_sockets",
+            r#"{"tcp":false,"udp":false}"#,
+        )
+        .await;
+        assert!(
+            out.error_message.contains("at least one of tcp/udp"),
+            "expected tcp/udp validation, got: {}",
+            out.error_message
+        );
+    }
+
+    #[tokio::test]
+    async fn show_network_validates_kind() {
+        let out = run(
+            "host_show_network",
+            r#"{"kind":"flush"}"#,
+        )
+        .await;
+        assert!(
+            out.error_message.contains("kind must be one of"),
+            "expected kind allowlist, got: {}",
+            out.error_message
+        );
+    }
+
+    #[tokio::test]
+    async fn hash_file_rejects_denylisted_path() {
+        let out = run("host_hash_file", r#"{"path":"/etc/shadow"}"#).await;
+        assert!(
+            out.error_message.contains("denylist"),
+            "expected denylist rejection, got: {}",
+            out.error_message
+        );
+    }
+
+    #[tokio::test]
+    async fn login_history_validates_kind() {
+        let out = run(
+            "host_login_history",
+            r#"{"kind":"sudo"}"#,
+        )
+        .await;
+        assert!(
+            out.error_message.contains("kind must be one of"),
+            "expected kind allowlist, got: {}",
+            out.error_message
+        );
+    }
+
+    #[tokio::test]
+    async fn read_journal_validates_since_format() {
+        // Valid RFC3339 must NOT fail validation. We can't assert success
+        // because the test host may lack `journalctl`; what we *can* assert
+        // is that the runner doesn't blow up on a plain `--since="now"`-
+        // style hijack attempt.
+        let bad = run(
+            "host_read_journal",
+            r#"{"since":"yesterday"}"#,
+        )
+        .await;
+        assert!(
+            bad.error_message.contains("RFC3339"),
+            "expected RFC3339 validation error, got: {}",
+            bad.error_message
+        );
+    }
+
+    #[tokio::test]
+    async fn read_journal_rejects_unit_with_dash_prefix() {
+        let out = run(
+            "host_read_journal",
+            r#"{"since":"2024-01-01T00:00:00Z","unit":"-uall.target"}"#,
+        )
+        .await;
+        assert!(
+            out.error_message.contains("unit must not start with '-'"),
+            "expected unit-prefix rejection, got: {}",
+            out.error_message
+        );
     }
 
     #[tokio::test]

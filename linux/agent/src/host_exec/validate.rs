@@ -213,6 +213,114 @@ pub fn cap_int(v: Option<u64>, default: u64, max: u64) -> u64 {
     n.clamp(1, max)
 }
 
+/// Parse an RFC3339 timestamp and re-format it the way `journalctl --since`
+/// expects, i.e. `YYYY-MM-DD HH:MM:SS UTC`. Anchoring to UTC removes the
+/// systemd-version-dependent timezone parsing we'd otherwise have to worry
+/// about, and `journalctl` accepts this form on every release we support.
+pub fn parse_rfc3339_to_journal(raw: &str, kind: &str) -> Result<String, HostExecError> {
+    if raw.is_empty() {
+        return Err(HostExecError::BadArg(format!("{kind} is empty")));
+    }
+    if raw.contains('\0') {
+        return Err(HostExecError::BadArg(format!("{kind} contains NUL byte")));
+    }
+    if raw.len() > 64 {
+        return Err(HostExecError::BadArg(format!("{kind} exceeds 64 bytes")));
+    }
+    let dt = chrono::DateTime::parse_from_rfc3339(raw).map_err(|e| {
+        HostExecError::BadArg(format!("{kind} is not a valid RFC3339 timestamp: {e}"))
+    })?;
+    Ok(dt
+        .with_timezone(&chrono::Utc)
+        .format("%Y-%m-%d %H:%M:%S UTC")
+        .to_string())
+}
+
+/// Validate a `journalctl -p` priority value. Accepts the names systemd
+/// itself accepts; numeric forms (0..=7) are also recognised.
+pub fn validate_journal_priority(raw: &str) -> Result<String, HostExecError> {
+    const NAMES: &[&str] = &[
+        "emerg", "alert", "crit", "err", "warning", "notice", "info", "debug",
+    ];
+    if NAMES.contains(&raw)
+        || (raw.len() == 1 && raw.chars().all(|c| ('0'..='7').contains(&c)))
+    {
+        return Ok(raw.to_string());
+    }
+    Err(HostExecError::BadArg(format!(
+        "priority must be one of {NAMES:?} or a single digit 0..=7, got {raw}"
+    )))
+}
+
+/// Validate a Linux PID. Reject 0 (no such process), negative, and anything
+/// above `PID_MAX_LIMIT` (4 194 304 — kernel ceiling on 64-bit).
+pub fn validate_pid(raw: u64) -> Result<u32, HostExecError> {
+    if raw == 0 {
+        return Err(HostExecError::BadArg("pid must be > 0".into()));
+    }
+    if raw > 4_194_304 {
+        return Err(HostExecError::BadArg(format!(
+            "pid {raw} exceeds PID_MAX_LIMIT"
+        )));
+    }
+    Ok(raw as u32)
+}
+
+/// Validate a TCP/UDP port number. 0 is reserved.
+pub fn validate_port(raw: u64) -> Result<u16, HostExecError> {
+    if raw == 0 || raw > 65_535 {
+        return Err(HostExecError::BadArg(format!(
+            "port must be 1..=65535, got {raw}"
+        )));
+    }
+    Ok(raw as u16)
+}
+
+/// Generic "must be one of these strings" guard.
+pub fn validate_choice<'a>(
+    raw: &'a str,
+    kind: &str,
+    choices: &[&str],
+) -> Result<&'a str, HostExecError> {
+    if choices.contains(&raw) {
+        Ok(raw)
+    } else {
+        Err(HostExecError::BadArg(format!(
+            "{kind} must be one of {choices:?}, got {raw}"
+        )))
+    }
+}
+
+/// Validate a systemd unit name (e.g. `sshd.service`, `nginx@http.service`).
+/// More permissive than a generic filter token because systemd unit names
+/// legitimately contain `.`, `@`, `\\` (escapes), `-`, and `:`.
+pub fn validate_unit_name(raw: &str) -> Result<String, HostExecError> {
+    if raw.is_empty() {
+        return Err(HostExecError::BadArg("unit is empty".into()));
+    }
+    if raw.len() > 256 {
+        return Err(HostExecError::BadArg("unit exceeds 256 bytes".into()));
+    }
+    // Refuse anything that could be misinterpreted as a flag / control char.
+    // Systemd unit names use a restricted alphabet; this matches it tightly
+    // enough to keep `--unit=…something…` from sneaking in.
+    let ok = raw.chars().all(|c| {
+        c.is_ascii_alphanumeric()
+            || matches!(c, '.' | '-' | '_' | '@' | ':' | '\\' | '/')
+    });
+    if !ok {
+        return Err(HostExecError::BadArg(format!(
+            "unit contains invalid characters: {raw}"
+        )));
+    }
+    if raw.starts_with('-') {
+        return Err(HostExecError::BadArg(
+            "unit must not start with '-'".into(),
+        ));
+    }
+    Ok(raw.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -317,5 +425,93 @@ mod tests {
         assert_eq!(cap_int(Some(0), 10, 100), 1);
         assert_eq!(cap_int(Some(99999), 10, 100), 100);
         assert_eq!(cap_int(Some(50), 10, 100), 50);
+    }
+
+    #[test]
+    fn rfc3339_parses_utc() {
+        let s = parse_rfc3339_to_journal("2024-01-02T03:04:05Z", "since").unwrap();
+        assert_eq!(s, "2024-01-02 03:04:05 UTC");
+    }
+
+    #[test]
+    fn rfc3339_parses_with_offset() {
+        // +05:30 input must be normalised to UTC.
+        let s = parse_rfc3339_to_journal("2024-01-02T08:34:05+05:30", "since").unwrap();
+        assert_eq!(s, "2024-01-02 03:04:05 UTC");
+    }
+
+    #[test]
+    fn rfc3339_rejects_bad_input() {
+        assert!(parse_rfc3339_to_journal("", "since").is_err());
+        assert!(parse_rfc3339_to_journal("yesterday", "since").is_err());
+        assert!(parse_rfc3339_to_journal("2024-01-02 03:04:05", "since").is_err());
+        assert!(parse_rfc3339_to_journal("--since=foo", "since").is_err());
+        assert!(parse_rfc3339_to_journal("2024-01-02T03:04:05Z\0evil", "since").is_err());
+    }
+
+    #[test]
+    fn priority_accepts_known_names_and_digits() {
+        for p in ["emerg", "alert", "crit", "err", "warning", "notice", "info", "debug"] {
+            assert!(validate_journal_priority(p).is_ok(), "name {p}");
+        }
+        for d in '0'..='7' {
+            assert!(validate_journal_priority(&d.to_string()).is_ok());
+        }
+    }
+
+    #[test]
+    fn priority_rejects_unknown() {
+        assert!(validate_journal_priority("urgent").is_err());
+        assert!(validate_journal_priority("8").is_err());
+        assert!(validate_journal_priority("12").is_err());
+        assert!(validate_journal_priority("").is_err());
+    }
+
+    #[test]
+    fn unit_accepts_typical_units() {
+        for u in [
+            "sshd.service",
+            "nginx.service",
+            "nginx@http.service",
+            "systemd-journald.service",
+            "user-1000.slice",
+            "machine.slice",
+        ] {
+            assert!(validate_unit_name(u).is_ok(), "unit {u}");
+        }
+    }
+
+    #[test]
+    fn unit_rejects_dashes_at_start_and_garbage() {
+        assert!(validate_unit_name("-u").is_err());
+        assert!(validate_unit_name("nginx; echo pwned").is_err());
+        assert!(validate_unit_name("foo bar.service").is_err());
+        assert!(validate_unit_name("").is_err());
+    }
+
+    #[test]
+    fn pid_validation() {
+        assert!(validate_pid(0).is_err());
+        assert!(validate_pid(1).is_ok());
+        assert!(validate_pid(123_456).is_ok());
+        assert!(validate_pid(4_194_304).is_ok());
+        assert!(validate_pid(4_194_305).is_err());
+    }
+
+    #[test]
+    fn port_validation() {
+        assert!(validate_port(0).is_err());
+        assert!(validate_port(1).is_ok());
+        assert!(validate_port(80).is_ok());
+        assert!(validate_port(65_535).is_ok());
+        assert!(validate_port(65_536).is_err());
+    }
+
+    #[test]
+    fn choice_validation() {
+        assert!(validate_choice("a", "kind", &["a", "b"]).is_ok());
+        assert!(validate_choice("b", "kind", &["a", "b"]).is_ok());
+        assert!(validate_choice("c", "kind", &["a", "b"]).is_err());
+        assert!(validate_choice("", "kind", &["a"]).is_err());
     }
 }

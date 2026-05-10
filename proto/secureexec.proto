@@ -441,6 +441,12 @@ message AckCommandRequest {
   int32  exit_code     = 7;
   bool   truncated     = 8;
   int64  duration_ms   = 9;
+  // Resolved, shell-quoted argv that the agent actually executed (e.g.
+  // `/usr/bin/journalctl --no-pager --since '2024-01-01 12:00:00 UTC' -n 200`).
+  // Empty for legacy commands. Captured for forensic-trail UX so an analyst
+  // can paste it into a shell on the host without reverse-engineering the
+  // runner code.
+  string command_line  = 10;
 }
 
 message AckCommandResponse {}

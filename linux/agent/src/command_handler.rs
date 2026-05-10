@@ -217,6 +217,7 @@ impl CommandHandler for LinuxCommandHandler {
                 exit_code: out.exit_code,
                 truncated: out.truncated,
                 duration_ms: out.duration_ms,
+                command_line: out.command_line,
             });
         }
         match cmd.command_type.as_str() {

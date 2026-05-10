@@ -29,6 +29,11 @@ pub struct CommandOutcome {
     pub exit_code: i32,
     pub truncated: bool,
     pub duration_ms: i64,
+    /// Shell-quoted argv that was actually executed. Captured so the audit
+    /// trail and chat UI can render the literal command an analyst could
+    /// paste into a terminal on the host. Empty for legacy commands that
+    /// don't shell out (isolate, release, kill_tree, uninstall).
+    pub command_line: String,
 }
 
 /// Platform-specific command execution.

@@ -501,6 +501,7 @@ impl GrpcControlClient {
             exit_code: outcome.exit_code,
             truncated: outcome.truncated,
             duration_ms: outcome.duration_ms,
+            command_line: outcome.command_line.clone(),
         });
         match client.ack_command(req).await {
             Ok(_) => Ok(()),
